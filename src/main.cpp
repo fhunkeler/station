@@ -1415,6 +1415,10 @@ void appendStationStatus(String& html) {
   row("Firmware", firmwareDate());
 }
 
+// Le panneau reste alimenté entre deux mises à jour : sur ce 4,2", le couper
+// (display.powerOff) grise le fond, qui ne s'éclaircit qu'au fil des
+// rafraîchissements partiels suivants (constaté sur l'écran réel).
+//
 // Rafraîchit les zones marquées comme modifiées. C'est le seul endroit qui
 // consomme les drapeaux gXxxNeedsUpdate. gExteriorNeedsUpdate couvre aussi
 // la prévision : elle alimente la bande vent et la condition météo.
@@ -1431,8 +1435,7 @@ void refreshDirtySections() {
     gGroundNeedsUpdate = false;
     gUpperNeedsUpdate = false;
     updateBottomSection();
-  }
-}
+  }}
 
 // Horodatage d'une mesure : updated_at fourni par HA, sinon l'heure de
 // réception. Un message retenu est redistribué à chaque reconnexion MQTT, et
@@ -1511,6 +1514,7 @@ void onMinuteTick() {
 void setup() {
   STATION_LOG_BEGIN(115200);
   STATION_LOG_PRINTLN("Démarrage de la station météo e-paper");
+  STATION_LOG_PRINTF("Processeur à %u MHz\n", static_cast<unsigned>(getCpuFrequencyMhz()));
 
   // Fuseau posé tout de suite : localtime_r est correct dès la synchro NTP.
   setenv("TZ", TZ_EUROPE_PARIS, 1);
@@ -1681,6 +1685,12 @@ void serviceNetwork() {
     wifiWasConnected = true;
     STATION_LOG_PRINT("WiFi connecté, IP: ");
     STATION_LOG_PRINTLN(WiFi.localIP());
+    if (!webPortalAccessPointActive()) {
+      // Veille radio renforcée : la station n'écoute la box qu'à certaines
+      // balises. MQTT et la page web gagnent quelques centaines de ms de
+      // latence, sans effet visible. Incompatible avec le point d'accès.
+      WiFi.setSleep(WIFI_PS_MAX_MODEM);
+    }
   }
 
   if (!timeConfigured) {

@@ -462,6 +462,7 @@ void webPortalStartAccessPoint() {
   // aucun téléphone ne peut encore en souffrir.
   scanNetworks();
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(WIFI_PS_NONE);  // un point d'accès en veille décroche les téléphones
   WiFi.softAP(accessPointName().c_str(), accessPointPassword().c_str());
   gDns.setErrorReplyCode(DNSReplyCode::NoError);
   gDns.start(DNS_PORT, "*", WiFi.softAPIP());
