@@ -733,23 +733,6 @@ const char* compassPoint(float bearingDegrees) {
   return POINTS[index];
 }
 
-// Libellé court des conditions météo de Home Assistant.
-const char* conditionLabel(const char* condition) {
-  static const char* const LABELS[][2] = {
-    {"clear-night", "Nuit claire"}, {"cloudy", "Couvert"}, {"exceptional", "Exceptionnel"},
-    {"fog", "Brouillard"}, {"hail", "Grêle"}, {"lightning", "Orage"},
-    {"lightning-rainy", "Orage"}, {"partlycloudy", "Éclaircies"}, {"pouring", "Averses"},
-    {"rainy", "Pluie"}, {"snowy", "Neige"}, {"snowy-rainy", "Pluie/neige"},
-    {"sunny", "Soleil"}, {"windy", "Venteux"}, {"windy-variant", "Venteux"},
-  };
-  for (const auto& entry : LABELS) {
-    if (strcmp(condition, entry[0]) == 0) {
-      return entry[1];
-    }
-  }
-  return "--";
-}
-
 const char* const FRENCH_DAY_NAMES[7] = {
   "Dimanche", "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi"
 };
@@ -996,8 +979,9 @@ int fontAscent(const GFXfont* font, const char* sample) {
 // la mise en page tienne quel que soit le thème typographique.
 void drawMeasureColumn(const char* title, int centerX, float temperature, const char* detail, const char* detail2) {
   const int titleBaseline = BOTTOM_AREA.y + 19;
-  const int temperatureBaseline = titleBaseline + 5 + fontAscent(FONT_LARGE, "0");
-  const int detailBaseline = temperatureBaseline + 4 + fontAscent(FONT_MEDIUM, "C");
+  // L'échantillon inclut le signe degré, qui dépasse le haut des chiffres.
+  const int temperatureBaseline = titleBaseline + 10 + fontAscent(FONT_LARGE, "0\xB0");
+  const int detailBaseline = temperatureBaseline + 7 + fontAscent(FONT_MEDIUM, "C");
   const int detail2Baseline = detailBaseline + 3 + fontAscent(FONT_SMALL, "0");
 
   useFont(FONT_SMALL_BOLD);
@@ -1038,7 +1022,7 @@ void drawBottomContent() {
     strcpy(pressureStr, "-- hPa");
   }
 
-  drawMeasureColumn("EXTÉRIEUR", col1, tempExterior, conditionLabel(weatherCondition), pressureStr);
+  drawMeasureColumn("EXTÉRIEUR", col1, tempExterior, pressureStr, nullptr);
   drawMeasureColumn("RDC", col2, tempRDC, humRdcStr, nullptr);
   drawMeasureColumn("ÉTAGE", col3, tempEtage, humEtageStr, nullptr);
 
