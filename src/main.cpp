@@ -1114,10 +1114,19 @@ void updateInteriorSeparator() {
   } while (display.nextPage());
 }
 
-// Rafraîchissement complet en une seule passe : efface la rémanence laissée
-// par les mises à jour partielles successives.
+// Rafraîchissement complet : efface la rémanence laissée par les mises à
+// jour partielles successives. Il se fait en deux temps, comme à l'origine :
+// passage au blanc en mode complet, puis contenu en mode partiel. Dessiné
+// directement par le mode complet rapide du 4,2", le contenu laisse un fond
+// grisâtre.
 void displayWeatherStation() {
   display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+  } while (display.nextPage());
+
+  display.setPartialWindow(0, 0, display.width(), display.height());
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
@@ -1129,7 +1138,6 @@ void displayWeatherStation() {
     drawVerticalSeparator(gLayout.centralSeparator);
     drawExteriorPanel(gLayout.exterior);
   } while (display.nextPage());
-  display.powerOff();
 
   gExteriorNeedsUpdate = false;
   gTideNeedsUpdate = false;
@@ -1140,25 +1148,18 @@ void displayWeatherStation() {
 // Rafraîchit les zones marquées comme modifiées. C'est le seul endroit qui
 // consomme les drapeaux gXxxNeedsUpdate.
 void refreshDirtySections() {
-  bool refreshed = false;
   if (gExteriorNeedsUpdate) {
     gExteriorNeedsUpdate = false;
     updateExteriorSection();
-    refreshed = true;
   }
   if (gTideNeedsUpdate) {
     gTideNeedsUpdate = false;
     updateTideSection();
-    refreshed = true;
   }
   if (gGroundNeedsUpdate || gUpperNeedsUpdate) {
     gGroundNeedsUpdate = false;
     gUpperNeedsUpdate = false;
     updateInteriorSection();
-    refreshed = true;
-  }
-  if (refreshed) {
-    display.powerOff();
   }
 }
 
@@ -1223,7 +1224,6 @@ void onMinuteTick() {
   }
   updateHeaderSection();
   refreshDirtySections();
-  display.powerOff();
 }
 
 void setup() {
