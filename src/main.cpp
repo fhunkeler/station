@@ -71,6 +71,8 @@ float tempExterior = NAN;
 int pressureAtmospheric = -1;
 float windBearingDegrees = NAN;
 float windSpeedKmh = NAN;
+float windGustKmh = NAN;
+char weatherCondition[16] = "";  // valeur HA brute : "cloudy", "rainy"...
 time_t forecastLastUpdateEpoch = 0;
 
 // Rez-de-chaussée
@@ -81,11 +83,11 @@ int humidityRDC = -1;
 float tempEtage = NAN;
 int humidityEtage = -1;
 
-// Instant (millis) de la dernière valeur reçue pour chaque source, afin de
-// neutraliser l'affichage si Home Assistant cesse de publier.
-unsigned long gOutdoorReceivedMs = 0;
-unsigned long gGroundReceivedMs = 0;
-unsigned long gFloorReceivedMs = 0;
+// Horodatage (epoch) de la dernière mesure de chaque source, afin de
+// neutraliser l'affichage si Home Assistant cesse de publier. 0 = inconnu.
+time_t gOutdoorMeasuredAt = 0;
+time_t gGroundMeasuredAt = 0;
+time_t gFloorMeasuredAt = 0;
 
 // WiFi
 const char* WIFI_SSID = STATION_WIFI_SSID;
@@ -104,8 +106,10 @@ const char* MQTT_PASSWORD = STATION_MQTT_PASSWORD;
 constexpr unsigned long NETWORK_RETRY_INTERVAL_MS = 30000UL;
 constexpr unsigned long WIFI_FORCE_RECONNECT_AFTER_MS = 120000UL;
 constexpr uint16_t MQTT_SOCKET_TIMEOUT_S = 5;
+constexpr uint16_t MQTT_KEEPALIVE_S = 60;
 // Au-delà, une mesure n'est plus affichée (HA arrêté, capteur muet...).
-constexpr unsigned long DATA_STALE_AFTER_MS = 3UL * 3600UL * 1000UL;
+// HA publie au moins toutes les heures : 3 h = trois publications manquées.
+constexpr time_t MEASUREMENT_STALE_AFTER_S = 3 * 3600;
 constexpr time_t FORECAST_STALE_AFTER_S = 3 * 3600;
 // Rafraîchissement complet périodique contre la rémanence des mises à jour partielles.
 constexpr int FULL_REFRESH_EVERY_MINUTES = 60;
@@ -147,6 +151,8 @@ struct ForecastPoint {
   time_t ts;
   float bearing;
   float speed;
+  float gust;
+  char condition[16];
 };
 
 constexpr int MAX_FORECAST_POINTS = 96;
@@ -500,7 +506,18 @@ bool updateTideForecastFromStoredEvents() {
     newPrevEpoch = gTideEvents[prevIdx].ts;
   }
 
-  bool changed = (nextTideEpoch != gTideEvents[nextIdx].ts) || (isTideRising != rising) || (tideCoefficient != gTideEvents[nextIdx].coeff) || (nextTideTime != newTideTime);
+  // Le coefficient se rapporte à la pleine mer, et celui des basses mers est
+  // incohérent dans les données (null pour la première de la journée) :
+  // prendre celui de la prochaine pleine mer.
+  int newCoefficient = gTideEvents[nextIdx].coeff;
+  for (int i = nextIdx; i < gTideEventCount; ++i) {
+    if (strcmp(gTideEvents[i].type, "HIGH") == 0) {
+      newCoefficient = gTideEvents[i].coeff;
+      break;
+    }
+  }
+
+  bool changed = (nextTideEpoch != gTideEvents[nextIdx].ts) || (isTideRising != rising) || (tideCoefficient != newCoefficient) || (nextTideTime != newTideTime);
   bool heightWasNaN = isnan(nextTideHeightMeters);
   bool heightIsNaN = isnan(gTideEvents[nextIdx].height);
   if (heightWasNaN != heightIsNaN) {
@@ -514,7 +531,7 @@ bool updateTideForecastFromStoredEvents() {
 
   nextTideTime = newTideTime;
   isTideRising = rising;
-  tideCoefficient = gTideEvents[nextIdx].coeff;
+  tideCoefficient = newCoefficient;
   nextTideHeightMeters = gTideEvents[nextIdx].height;
   nextTideEpoch = gTideEvents[nextIdx].ts;
   prevTideTime = newPrevTime;
@@ -953,25 +970,46 @@ void refreshDirtySections() {
   }
 }
 
-static bool isStale(unsigned long receivedMs, unsigned long nowMs) {
-  return (nowMs - receivedMs) >= DATA_STALE_AFTER_MS;
+// Horodatage d'une mesure : updated_at fourni par HA, sinon l'heure de
+// réception. Un message retenu est redistribué à chaque reconnexion MQTT, et
+// HA ne publie rien quand un capteur est indisponible : seul updated_at
+// permet de savoir qu'une valeur est ancienne.
+time_t measurementTimestamp(const JsonDocument& doc) {
+  time_t ts = 0;
+  if (parseIso8601ToTime(doc["updated_at"] | "", ts)) {
+    return ts;
+  }
+  currentEpoch(ts);  // reste à 0 si l'heure est encore inconnue
+  return ts;
+}
+
+bool isMeasurementStale(time_t& measuredAt) {
+  time_t nowTs = 0;
+  if (!currentEpoch(nowTs)) {
+    return false;
+  }
+  if (measuredAt == 0) {
+    // Reçue avant la synchro de l'heure : dater à partir de maintenant.
+    measuredAt = nowTs;
+    return false;
+  }
+  return (nowTs - measuredAt) > MEASUREMENT_STALE_AFTER_S;
 }
 
 // Efface les mesures que Home Assistant n'a plus publiées depuis trop
 // longtemps, pour ne pas afficher indéfiniment une valeur figée.
 void expireStaleMeasurements() {
-  const unsigned long nowMs = millis();
-  if ((!isnan(tempExterior) || pressureAtmospheric >= 0) && isStale(gOutdoorReceivedMs, nowMs)) {
+  if ((!isnan(tempExterior) || pressureAtmospheric >= 0) && isMeasurementStale(gOutdoorMeasuredAt)) {
     tempExterior = NAN;
     pressureAtmospheric = -1;
     gExteriorNeedsUpdate = true;
   }
-  if ((!isnan(tempRDC) || humidityRDC >= 0) && isStale(gGroundReceivedMs, nowMs)) {
+  if ((!isnan(tempRDC) || humidityRDC >= 0) && isMeasurementStale(gGroundMeasuredAt)) {
     tempRDC = NAN;
     humidityRDC = -1;
     gGroundNeedsUpdate = true;
   }
-  if ((!isnan(tempEtage) || humidityEtage >= 0) && isStale(gFloorReceivedMs, nowMs)) {
+  if ((!isnan(tempEtage) || humidityEtage >= 0) && isMeasurementStale(gFloorMeasuredAt)) {
     tempEtage = NAN;
     humidityEtage = -1;
     gUpperNeedsUpdate = true;
@@ -1121,6 +1159,8 @@ bool connectToMQTT() {
     configured = true;
     gMqttClient.setServer(MQTT_HOST, MQTT_PORT);
     gMqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
+    // 15 s par défaut : le broker coupait la station plusieurs fois par mois.
+    gMqttClient.setKeepAlive(MQTT_KEEPALIVE_S);
     if (!gMqttClient.setBufferSize(MQTT_BUFFER_SIZE_BYTES)) {
       // Sans ce contrôle, un échec d'allocation se traduisait par des messages
       // tronqués silencieusement, donc par un JSON invalide.
@@ -1154,6 +1194,32 @@ bool connectToMQTT() {
   subscribeAndLog(TOPIC_GROUND);
   subscribeAndLog(TOPIC_FLOOR);
   subscribeAndLog(TOPIC_FORECAST);
+  return true;
+}
+
+float readNumber(JsonVariantConst value) {
+  return value.is<float>() ? value.as<float>() : NAN;
+}
+
+// Affecte une température ; renvoie vrai si la valeur affichée change.
+bool assignTemperature(float& target, float value) {
+  if (isnan(value) && isnan(target)) {
+    return false;
+  }
+  if (!isnan(value) && !isnan(target) && fabsf(value - target) <= 0.01f) {
+    return false;
+  }
+  target = value;
+  return true;
+}
+
+// Affecte une valeur entière bornée (-1 = inconnue) ; vrai si elle change.
+bool assignRounded(int& target, float value, int minValue, int maxValue) {
+  const int rounded = isnan(value) ? -1 : constrain(static_cast<int>(roundf(value)), minValue, maxValue);
+  if (rounded == target) {
+    return false;
+  }
+  target = rounded;
   return true;
 }
 
@@ -1192,76 +1258,43 @@ void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
+  // Chaque message est un instantané complet : un champ absent, null ou non
+  // numérique signifie que la valeur est inconnue.
+  const time_t measuredAt = measurementTimestamp(doc);
+  time_t staleCheck = measuredAt;
+  if (isMeasurementStale(staleCheck)) {
+    STATION_LOG_PRINTLN("Mesure MQTT trop ancienne, ignorée");
+    return;
+  }
+  const float temperature = readNumber(doc["temperature"]);
+
   if (topicStr == TOPIC_OUTDOOR) {
-    bool updated = false;
-    JsonVariantConst tempVar = doc["temperature"];
-    if (tempVar.is<float>()) {
-      float newTemp = tempVar.as<float>();
-      if (!isnan(newTemp)) {
-        gOutdoorReceivedMs = millis();
-      }
-      if (!isnan(newTemp) && (isnan(tempExterior) || fabsf(newTemp - tempExterior) > 0.01f)) {
-        tempExterior = newTemp;
-        updated = true;
-      }
-    }
-    JsonVariantConst pressureVar = doc["pressure"];
-    if (pressureVar.is<float>()) {
-      float newPressure = pressureVar.as<float>();
-      if (!isnan(newPressure)) {
-        gOutdoorReceivedMs = millis();
-        int rounded = static_cast<int>(roundf(newPressure));
-        if (rounded != pressureAtmospheric) {
-          pressureAtmospheric = rounded;
-          updated = true;
-        }
-      }
-    }
+    gOutdoorMeasuredAt = measuredAt;
+    bool updated = assignTemperature(tempExterior, temperature);
+    updated |= assignRounded(pressureAtmospheric, readNumber(doc["pressure"]), 0, 2000);
     if (updated) {
       gExteriorNeedsUpdate = true;
     }
     return;
   }
 
-  auto handleInteriorPayload = [&](float& tempTarget, int& humidityTarget, bool& refreshFlag,
-                                    unsigned long& receivedMs) {
-    bool updated = false;
-    JsonVariantConst tempVar = doc["temperature"];
-    if (tempVar.is<float>()) {
-      float newTemp = tempVar.as<float>();
-      if (!isnan(newTemp)) {
-        receivedMs = millis();
-      }
-      if (!isnan(newTemp) && (isnan(tempTarget) || fabsf(newTemp - tempTarget) > 0.01f)) {
-        tempTarget = newTemp;
-        updated = true;
-      }
-    }
-    JsonVariantConst humidityVar = doc["humidity"];
-    if (humidityVar.is<float>()) {
-      float newHum = humidityVar.as<float>();
-      if (!isnan(newHum)) {
-        receivedMs = millis();
-        int rounded = static_cast<int>(roundf(newHum));
-        rounded = constrain(rounded, 0, 100);
-        if (humidityTarget < 0 || rounded != humidityTarget) {
-          humidityTarget = rounded;
-          updated = true;
-        }
-      }
-    }
-    if (updated) {
-      refreshFlag = true;
-    }
-  };
-
   if (topicStr == TOPIC_GROUND) {
-    handleInteriorPayload(tempRDC, humidityRDC, gGroundNeedsUpdate, gGroundReceivedMs);
+    gGroundMeasuredAt = measuredAt;
+    bool updated = assignTemperature(tempRDC, temperature);
+    updated |= assignRounded(humidityRDC, readNumber(doc["humidity"]), 0, 100);
+    if (updated) {
+      gGroundNeedsUpdate = true;
+    }
     return;
   }
 
   if (topicStr == TOPIC_FLOOR) {
-    handleInteriorPayload(tempEtage, humidityEtage, gUpperNeedsUpdate, gFloorReceivedMs);
+    gFloorMeasuredAt = measuredAt;
+    bool updated = assignTemperature(tempEtage, temperature);
+    updated |= assignRounded(humidityEtage, readNumber(doc["humidity"]), 0, 100);
+    if (updated) {
+      gUpperNeedsUpdate = true;
+    }
     return;
   }
 }
@@ -1315,10 +1348,19 @@ bool loadForecastFromJson(const char* payload, size_t length) {
     return false;
   }
 
+  // Le message fait ~17 Ko et 73 points de 10 champs : ne garder que les
+  // champs utilisés divise par plusieurs la mémoire du document JSON.
+  JsonDocument filter;
+  for (const char* key : {"datetime", "time", "wind_bearing", "wind_speed", "wind_gust_speed", "condition"}) {
+    filter["weather.trelevern"]["forecast"][0][key] = true;
+    filter["forecast"][0][key] = true;
+  }
+
   JsonDocument doc;
+  const auto filterOption = DeserializationOption::Filter(filter);
   DeserializationError err = length > 0
-                             ? deserializeJson(doc, payload, length)
-                             : deserializeJson(doc, payload);
+                             ? deserializeJson(doc, payload, length, filterOption)
+                             : deserializeJson(doc, payload, filterOption);
   if (err) {
     STATION_LOG_PRINT("Erreur JSON prévision: ");
     STATION_LOG_PRINTLN(err.f_str());
@@ -1366,10 +1408,15 @@ bool loadForecastFromJson(const char* payload, size_t length) {
       if (bearing < 0) bearing += 360.0f;
     }
     float speed = entry["wind_speed"].isNull() ? NAN : entry["wind_speed"].as<float>();
+    float gust = entry["wind_gust_speed"].isNull() ? NAN : entry["wind_gust_speed"].as<float>();
 
-    gForecastPoints[gForecastCount].ts = ts;
-    gForecastPoints[gForecastCount].bearing = bearing;
-    gForecastPoints[gForecastCount].speed = speed;
+    ForecastPoint& point = gForecastPoints[gForecastCount];
+    point.ts = ts;
+    point.bearing = bearing;
+    point.speed = speed;
+    point.gust = gust;
+    strncpy(point.condition, entry["condition"] | "", sizeof(point.condition) - 1);
+    point.condition[sizeof(point.condition) - 1] = '\0';
     ++gForecastCount;
   }
 
@@ -1414,11 +1461,15 @@ bool updateForecastFromStoredData() {
   const ForecastPoint& point = gForecastPoints[targetIdx];
   float newBearing = point.bearing;
   float newSpeed = point.speed;
+  float newGust = point.gust;
+  const char* newCondition = point.condition;
   time_t newEpoch = point.ts;
   // Prévision qui n'a plus été renouvelée : ne pas figer un vent ancien.
   if (nowTs - point.ts > FORECAST_STALE_AFTER_S) {
     newBearing = NAN;
     newSpeed = NAN;
+    newGust = NAN;
+    newCondition = "";
   }
 
   struct tm pointTm;
@@ -1439,11 +1490,20 @@ bool updateForecastFromStoredData() {
     if ((isnan(windSpeedKmh) != isnan(newSpeed)) || (!isnan(newSpeed) && fabsf(windSpeedKmh - newSpeed) > 0.1f)) {
       changed = true;
     }
+    if ((isnan(windGustKmh) != isnan(newGust)) || (!isnan(newGust) && fabsf(windGustKmh - newGust) > 0.1f)) {
+      changed = true;
+    }
+    if (strcmp(weatherCondition, newCondition) != 0) {
+      changed = true;
+    }
   }
 
   if (changed) {
     windBearingDegrees = newBearing;
     windSpeedKmh = newSpeed;
+    windGustKmh = newGust;
+    strncpy(weatherCondition, newCondition, sizeof(weatherCondition) - 1);
+    weatherCondition[sizeof(weatherCondition) - 1] = '\0';
     forecastLastUpdateEpoch = newEpoch;
     gExteriorNeedsUpdate = true;
   }
