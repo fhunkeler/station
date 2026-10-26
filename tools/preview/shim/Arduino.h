@@ -77,5 +77,9 @@ struct SerialStub {
   template <class... A> void printf(A...) {}
 };
 extern SerialStub Serial;
-struct EspStub { uint64_t getEfuseMac() { return 0xC0FFEE; } };
+struct EspStub {
+  uint64_t getEfuseMac() { return 0x3C61053C2F0FULL; }
+  uint32_t getFreeHeap() { return 180000; }
+  void restart() {}
+};
 extern EspStub ESP;

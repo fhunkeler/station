@@ -10,7 +10,9 @@
 
 #include "station_fonts.h"
 #include "moon_icons.h"
-#include "secrets.h"
+#include <qrcode.h>
+#include "station_config.h"
+#include "web_portal.h"
 
 // Set ENABLE_STATION_LOGS to 0 at build time to strip Serial logs in production.
 #ifndef ENABLE_STATION_LOGS
@@ -83,39 +85,39 @@ time_t gOutdoorMeasuredAt = 0;
 time_t gGroundMeasuredAt = 0;
 time_t gFloorMeasuredAt = 0;
 
-// WiFi
-const char* WIFI_SSID = STATION_WIFI_SSID;
-const char* WIFI_PASSWORD = STATION_WIFI_PASSWORD;
+// WiFi et MQTT : identifiants et adresses dans gConfig (station_config.h).
 constexpr const char* TZ_EUROPE_PARIS = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 constexpr const char* NTP_SERVER_1 = "fr.pool.ntp.org";
 constexpr const char* NTP_SERVER_2 = "pool.ntp.org";
 constexpr const char* NTP_SERVER_3 = "time.google.com";
 
-const char* MQTT_HOST = STATION_MQTT_HOST;
-constexpr uint16_t MQTT_PORT = 1883;
-const char* MQTT_USERNAME = STATION_MQTT_USERNAME;
-const char* MQTT_PASSWORD = STATION_MQTT_PASSWORD;
 // Une seule tentative de connexion par intervalle : la boucle ne doit jamais
 // rester bloquée plusieurs secondes, sinon l'horloge affichée prend du retard.
 constexpr unsigned long NETWORK_RETRY_INTERVAL_MS = 30000UL;
 constexpr unsigned long WIFI_FORCE_RECONNECT_AFTER_MS = 120000UL;
 constexpr uint16_t MQTT_SOCKET_TIMEOUT_S = 5;
 constexpr uint16_t MQTT_KEEPALIVE_S = 60;
-// Au-delà, une mesure n'est plus affichée (HA arrêté, capteur muet...).
-// HA publie au moins toutes les heures : 3 h = trois publications manquées.
-constexpr time_t MEASUREMENT_STALE_AFTER_S = 3 * 3600;
+// L'âge maximal d'une mesure est réglable (gConfig.staleHours, 3 h par
+// défaut : HA publie au moins toutes les heures).
 constexpr time_t FORECAST_STALE_AFTER_S = 3 * 3600;
 // Rafraîchissement complet périodique contre la rémanence des mises à jour partielles.
 constexpr int FULL_REFRESH_EVERY_MINUTES = 60;
-// Nettoyage noir/blanc quotidien, à une heure où personne ne regarde.
-constexpr int GHOST_CLEANING_HOUR = 4;
+// Nettoyage noir/blanc quotidien à gConfig.ghostCleaningHour (4 h par défaut).
+// En mode configuration, nouvel essai du WiFi de la maison à cet intervalle,
+// seulement si personne n'est connecté au point d'accès.
+constexpr unsigned long CONFIG_MODE_WIFI_RETRY_MS = 5UL * 60UL * 1000UL;
+// Fenêtre pendant laquelle un second reset demande le mode configuration.
+constexpr unsigned long DOUBLE_RESET_WINDOW_MS = 10000UL;
 // Un horodatage antérieur à 2020 signifie que l'horloge n'a jamais été réglée.
 constexpr time_t MIN_VALID_EPOCH = 1577836800;
-constexpr const char* TOPIC_TIDE = "station/tide";
-constexpr const char* TOPIC_OUTDOOR = "station/outdoor";
-constexpr const char* TOPIC_GROUND = "station/ground";
-constexpr const char* TOPIC_FLOOR = "station/floor";
-constexpr const char* TOPIC_FORECAST = "station/forecast";
+// Sujets MQTT : <préfixe>/<suffixe>, le préfixe étant réglable.
+const char* const TOPIC_SUFFIXES[] = {"tide", "outdoor", "ground", "floor", "forecast"};
+char gTopicNames[5][48];
+const char* const TOPIC_TIDE = gTopicNames[0];
+const char* const TOPIC_OUTDOOR = gTopicNames[1];
+const char* const TOPIC_GROUND = gTopicNames[2];
+const char* const TOPIC_FLOOR = gTopicNames[3];
+const char* const TOPIC_FORECAST = gTopicNames[4];
 constexpr size_t MQTT_BUFFER_SIZE_BYTES = 32768;
 constexpr size_t MAX_PIXELS_MOON = MOON_ICON_SIZE * MOON_ICON_SIZE;
 constexpr size_t MAX_BITMAP_PIXELS = MAX_PIXELS_MOON;
@@ -123,10 +125,6 @@ constexpr size_t MAX_MONO_BITMAP_BYTES = MAX_BITMAP_PIXELS / 8;
 constexpr double SYNODIC_MONTH_DAYS = 29.530588853;
 constexpr double KNOWN_NEW_MOON_JD = 2451550.1;  // 6 janvier 2000 18:14 UTC
 constexpr double UNIX_EPOCH_JD = 2440587.5;
-
-#ifndef WIND_ARROW_STYLE
-#define WIND_ARROW_STYLE 1
-#endif
 
 #if ENABLE_STATION_LOGS
 constexpr uint32_t DISPLAY_DIAG_BAUD = 115200;
@@ -189,6 +187,17 @@ bool gTideNeedsUpdate = false;
 // l'écran de démarrage.
 const char* const STATION_TOPICS[] = {TOPIC_TIDE, TOPIC_OUTDOOR, TOPIC_GROUND, TOPIC_FLOOR, TOPIC_FORECAST};
 constexpr int STATION_TOPIC_COUNT = sizeof(STATION_TOPICS) / sizeof(STATION_TOPICS[0]);
+
+void buildMqttTopics() {
+  for (int i = 0; i < STATION_TOPIC_COUNT; ++i) {
+    snprintf(gTopicNames[i], sizeof(gTopicNames[i]), "%s/%s", gConfig.topicPrefix, TOPIC_SUFFIXES[i]);
+  }
+}
+
+// Mode configuration : point d'accès ouvert et écran d'instructions affiché
+// à la place des mesures.
+enum class ConfigReason : uint8_t { NONE, NO_WIFI_SETTINGS, WIFI_UNREACHABLE, REQUESTED };
+ConfigReason gConfigReason = ConfigReason::NONE;
 uint8_t gReceivedTopicsMask = 0;
 
 // Étapes affichées par l'écran de démarrage.
@@ -1027,9 +1036,9 @@ void drawBottomContent() {
     strcpy(pressureStr, "-- hPa");
   }
 
-  drawMeasureColumn("EXTÉRIEUR", col1, tempExterior, pressureStr, nullptr);
-  drawMeasureColumn("RDC", col2, tempRDC, humRdcStr, nullptr);
-  drawMeasureColumn("ÉTAGE", col3, tempEtage, humEtageStr, nullptr);
+  drawMeasureColumn(gConfig.labelOutdoor, col1, tempExterior, pressureStr, nullptr);
+  drawMeasureColumn(gConfig.labelGround, col2, tempRDC, humRdcStr, nullptr);
+  drawMeasureColumn(gConfig.labelFloor, col3, tempEtage, humEtageStr, nullptr);
 
   display.fillRect(SCREEN_MARGIN, BOTTOM_AREA.y, width - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
   const int separatorTop = BOTTOM_AREA.y + 10;
@@ -1125,15 +1134,21 @@ void drawSplashContent() {
     printAligned(detail, detailRight, baseline, ALIGN_RIGHT);
   }
 
-  // __DATE__ vaut "Oct 26 2026" : le remettre en français.
+  char footer[64];
+  snprintf(footer, sizeof(footer), "Réglages : http://%s.local", gConfig.hostname);
+  useFont(FONT_SMALL);
+  printAligned(footer, centerX, display.height() - 8, ALIGN_CENTER);
+}
+
+// Date de compilation en français ("26 octobre 2026"), __DATE__ valant
+// "Oct 26 2026".
+String firmwareDate() {
   static const char* const BUILD_MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec";
   const char* monthPos = strstr(BUILD_MONTHS, String(__DATE__).substring(0, 3).c_str());
   const int buildMonth = monthPos != nullptr ? static_cast<int>(monthPos - BUILD_MONTHS) / 3 : 0;
-  char buildStr[40];
-  snprintf(buildStr, sizeof(buildStr), "Firmware du %d %s %s", atoi(__DATE__ + 4),
-           FRENCH_MONTH_NAMES[buildMonth], __DATE__ + 7);
-  useFont(FONT_SMALL);
-  printAligned(buildStr, centerX, display.height() - 8, ALIGN_CENTER);
+  char buildStr[32];
+  snprintf(buildStr, sizeof(buildStr), "%d %s %s", atoi(__DATE__ + 4), FRENCH_MONTH_NAMES[buildMonth], __DATE__ + 7);
+  return String(buildStr);
 }
 
 void updateSplashScreen() {
@@ -1162,7 +1177,7 @@ bool refreshBootSteps() {
 
   BootStep& mqtt = gBootSteps[BOOT_STEP_MQTT];
   mqtt.state = mqttUp ? STEP_DONE : (wifiUp ? STEP_RUNNING : STEP_PENDING);
-  snprintf(mqtt.detail, sizeof(mqtt.detail), "%s", mqttUp ? MQTT_HOST : "");
+  snprintf(mqtt.detail, sizeof(mqtt.detail), "%s", mqttUp ? gConfig.mqttHost : "");
 
   BootStep& clock = gBootSteps[BOOT_STEP_TIME];
   clock.state = gTimeValid ? STEP_DONE : (wifiUp ? STEP_RUNNING : STEP_PENDING);
@@ -1193,12 +1208,11 @@ void clearPanelGhosts() {
   }
 }
 
-// Rafraîchissement complet : efface la rémanence laissée par les mises à
-// jour partielles successives. Il se fait en deux temps, comme à l'origine :
-// passage au blanc en mode complet, puis contenu en mode partiel. Dessiné
-// directement par le mode complet rapide du 4,2", le contenu laisse un fond
-// grisâtre.
-void displayWeatherStation() {
+// Rafraîchissement complet d'un écran entier. Il se fait en deux temps,
+// comme à l'origine : passage au blanc en mode complet, puis contenu en mode
+// partiel. Dessiné directement par le mode complet rapide du 4,2", le
+// contenu laisse un fond grisâtre.
+void showFullScreen(void (*draw)()) {
   display.setFullWindow();
   display.firstPage();
   do {
@@ -1209,16 +1223,198 @@ void displayWeatherStation() {
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
-    drawHeaderContent();
-    drawTideContent();
-    drawWindContent();
-    drawBottomContent();
+    draw();
   } while (display.nextPage());
+}
+
+void drawAllSections() {
+  drawHeaderContent();
+  drawTideContent();
+  drawWindContent();
+  drawBottomContent();
+}
+
+// Rafraîchissement complet de l'écran principal : efface aussi la rémanence
+// laissée par les mises à jour partielles successives.
+void displayWeatherStation() {
+  showFullScreen(drawAllSections);
 
   gExteriorNeedsUpdate = false;
   gTideNeedsUpdate = false;
   gGroundNeedsUpdate = false;
   gUpperNeedsUpdate = false;
+}
+
+// QR code "rejoindre ce réseau WiFi", reconnu par l'appareil photo des
+// téléphones.
+void drawWifiQrCode(int left, int top, int moduleSize, const String& ssid, const String& password) {
+  constexpr uint8_t QR_VERSION = 4;  // 33 x 33 modules, jusqu'à 78 caractères
+  uint8_t buffer[qrcode_getBufferSize(QR_VERSION)];
+  QRCode qr;
+  const String payload = String("WIFI:T:WPA;S:") + ssid + ";P:" + password + ";;";
+  if (qrcode_initText(&qr, buffer, QR_VERSION, ECC_MEDIUM, payload.c_str()) != 0) {
+    return;
+  }
+  for (uint8_t y = 0; y < qr.size; ++y) {
+    for (uint8_t x = 0; x < qr.size; ++x) {
+      if (qrcode_getModule(&qr, x, y)) {
+        display.fillRect(left + x * moduleSize, top + y * moduleSize, moduleSize, moduleSize, GxEPD_BLACK);
+      }
+    }
+  }
+}
+
+void drawConfigScreenContent() {
+  display.setTextColor(GxEPD_BLACK);
+  const int width = display.width();
+  const String ssid = accessPointName();
+  const String password = accessPointPassword();
+
+  useFont(FONT_LARGE);
+  printAligned("Configuration", width / 2, 44, ALIGN_CENTER);
+  char reason[64];
+  switch (gConfigReason) {
+    case ConfigReason::NO_WIFI_SETTINGS:
+      snprintf(reason, sizeof(reason), "Aucun réseau WiFi configuré");
+      break;
+    case ConfigReason::WIFI_UNREACHABLE:
+      snprintf(reason, sizeof(reason), "WiFi « %s » injoignable", gConfig.wifiSsid);
+      break;
+    default:
+      snprintf(reason, sizeof(reason), "Mode configuration demandé");
+      break;
+  }
+  useFont(FONT_MEDIUM);
+  printAligned(reason, width / 2, 74, ALIGN_CENTER);
+  display.fillRect(SCREEN_MARGIN, 88, width - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
+
+  const int x = SCREEN_MARGIN + 4;
+  useFont(FONT_SMALL);
+  printAligned("1. Rejoindre le réseau WiFi", x, 116, ALIGN_LEFT);
+  useFont(FONT_MEDIUM_BOLD);
+  printAligned(ssid.c_str(), x + 12, 142, ALIGN_LEFT);
+  useFont(FONT_SMALL);
+  printAligned("Mot de passe", x + 12, 166, ALIGN_LEFT);
+  useFont(FONT_MEDIUM_BOLD);
+  printAligned(password.c_str(), x + 12, 192, ALIGN_LEFT);
+  useFont(FONT_SMALL);
+  printAligned("2. Ouvrir la page", x, 224, ALIGN_LEFT);
+  useFont(FONT_MEDIUM_BOLD);
+  printAligned("http://192.168.4.1", x + 12, 250, ALIGN_LEFT);
+
+  constexpr int QR_MODULE = 4;
+  const int qrSize = 33 * QR_MODULE;
+  const int qrLeft = width - SCREEN_MARGIN - qrSize;
+  drawWifiQrCode(qrLeft, 104, QR_MODULE, ssid, password);
+  useFont(FONT_SMALL);
+  printAligned("Scanner pour rejoindre", width - SCREEN_MARGIN, 104 + qrSize + 20, ALIGN_RIGHT);
+
+  printAligned("Les réglages enregistrés redémarrent la station.", width / 2, display.height() - 8, ALIGN_CENTER);
+}
+
+// Ouvre le point d'accès de configuration et affiche ses instructions.
+void enterConfigMode(ConfigReason reason) {
+  gConfigReason = reason;
+  webPortalStartAccessPoint();
+  STATION_LOG_PRINT("Mode configuration, point d'accès ");
+  STATION_LOG_PRINTLN(accessPointName());
+  showFullScreen(drawConfigScreenContent);
+}
+
+// Le WiFi de la maison est revenu pendant le mode configuration ouvert faute
+// de réseau : refermer le point d'accès et reprendre l'affichage normal.
+void leaveConfigMode() {
+  gConfigReason = ConfigReason::NONE;
+  webPortalStopAccessPoint();
+  updateDateTimeFromClock();
+  updateMoonData();
+  updateTideForecastFromStoredEvents();
+  updateForecastFromStoredData();
+  displayWeatherStation();
+}
+
+// Referme la fenêtre de double reset après quelques secondes de marche.
+void serviceDoubleResetWindow() {
+  static bool closed = false;
+  if (!closed && millis() >= DOUBLE_RESET_WINDOW_MS) {
+    closed = true;
+    closeDoubleResetWindow();
+  }
+}
+
+// État courant pour la page d'accueil de l'interface web.
+void appendStationStatus(String& html) {
+  auto row = [&](const char* label, const String& value) {
+    html += "<tr><td>";
+    html += label;
+    html += "</td><td>";
+    html += value;
+    html += "</td></tr>";
+  };
+  char buffer[96];
+
+  if (gTimeValid) {
+    snprintf(buffer, sizeof(buffer), "%02d:%02d, %s %d %s", gNow.tm_hour, gNow.tm_min,
+             FRENCH_DAY_NAMES[gNow.tm_wday % 7], gNow.tm_mday, FRENCH_MONTH_NAMES[gNow.tm_mon % 12]);
+    row("Heure", buffer);
+  } else {
+    row("Heure", "non synchronisée");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(buffer, sizeof(buffer), " (%d dBm)<br>", WiFi.RSSI());
+    row("WiFi", webPortalEscape(gConfig.wifiSsid) + buffer + WiFi.localIP().toString() + " · " +
+                    webPortalEscape(gConfig.hostname) + ".local");
+  } else {
+    row("WiFi", gConfig.wifiSsid[0] != '\0' ? "non connecté" : "non configuré");
+  }
+  if (webPortalAccessPointActive()) {
+    snprintf(buffer, sizeof(buffer), " (%d appareil(s) connecté(s))", webPortalAccessPointClients());
+    row("Point d'accès", webPortalEscape(accessPointName().c_str()) + buffer);
+  }
+
+  snprintf(buffer, sizeof(buffer), ":%u — %s", gConfig.mqttPort, gMqttClient.connected() ? "connecté" : "déconnecté");
+  row("Serveur MQTT", webPortalEscape(gConfig.mqttHost) + buffer);
+
+  String sources;
+  for (int i = 0; i < STATION_TOPIC_COUNT; ++i) {
+    if (i > 0) {
+      sources += ", ";
+    }
+    sources += webPortalEscape(STATION_TOPICS[i]);
+    sources += ((gReceivedTopicsMask >> i) & 1U) ? " ✓" : " ✗";
+  }
+  row("Sources reçues", sources);
+
+  auto measure = [&](float temperature, int second, const char* unit) {
+    String text = isnan(temperature) ? String("--") : String(temperature, 1) + " °C";
+    text += " · ";
+    text += second >= 0 ? String(second) + unit : String("--");
+    return text;
+  };
+  row(webPortalEscape(gConfig.labelOutdoor).c_str(), measure(tempExterior, pressureAtmospheric, " hPa"));
+  row(webPortalEscape(gConfig.labelGround).c_str(), measure(tempRDC, humidityRDC, " %"));
+  row(webPortalEscape(gConfig.labelFloor).c_str(), measure(tempEtage, humidityEtage, " %"));
+
+  if (nextTideEpoch != 0) {
+    snprintf(buffer, sizeof(buffer), "%s, prochaine étale à %s, coefficient %d",
+             isTideRising ? "montante" : "descendante", nextTideTime.c_str(), tideCoefficient);
+    row("Marée", buffer);
+  } else {
+    row("Marée", "données indisponibles");
+  }
+  if (!isnan(windSpeedKmh) && !isnan(windBearingDegrees)) {
+    snprintf(buffer, sizeof(buffer), "%.0f km/h %s, rafales %.0f km/h", windSpeedKmh,
+             compassPoint(windBearingDegrees), windGustKmh);
+    row("Vent", buffer);
+  }
+
+  const unsigned long uptimeMin = millis() / 60000UL;
+  snprintf(buffer, sizeof(buffer), "%lu j %lu h %lu min", uptimeMin / 1440UL, (uptimeMin / 60UL) % 24UL, uptimeMin % 60UL);
+  row("En marche depuis", buffer);
+  snprintf(buffer, sizeof(buffer), "%u Ko libres", static_cast<unsigned>(ESP.getFreeHeap() / 1024));
+  row("Mémoire", buffer);
+  row("Firmware", firmwareDate());
 }
 
 // Rafraîchit les zones marquées comme modifiées. C'est le seul endroit qui
@@ -1263,7 +1459,7 @@ bool isMeasurementStale(time_t& measuredAt) {
     measuredAt = nowTs;
     return false;
   }
-  return (nowTs - measuredAt) > MEASUREMENT_STALE_AFTER_S;
+  return (nowTs - measuredAt) > static_cast<time_t>(gConfig.staleHours) * 3600;
 }
 
 // Efface les mesures que Home Assistant n'a plus publiées depuis trop
@@ -1298,7 +1494,7 @@ void onMinuteTick() {
     gTideNeedsUpdate = true;  // fait glisser la courbe et le repère "maintenant"
   }
 
-  if (gTimeValid && gNow.tm_hour == GHOST_CLEANING_HOUR && gNow.tm_min == 0) {
+  if (gTimeValid && gNow.tm_hour == gConfig.ghostCleaningHour && gNow.tm_min == 0) {
     minutesSinceFullRefresh = 0;
     clearPanelGhosts();
     displayWeatherStation();
@@ -1322,8 +1518,21 @@ void setup() {
   setenv("TZ", TZ_EUROPE_PARIS, 1);
   tzset();
 
+  loadStationConfig();
+  buildMqttTopics();
+  const bool configRequested = consumeDoubleReset();
+
   display.init(DISPLAY_DIAG_BAUD);
   display.setRotation(0); // Mode paysage (400x300)
+  display.setTextWrap(false);  // le texte est toujours placé explicitement
+
+  WiFi.mode(WIFI_STA);
+  webPortalBegin();
+  if (configRequested || gConfig.wifiSsid[0] == '\0') {
+    clearPanelGhosts();
+    enterConfigMode(configRequested ? ConfigReason::REQUESTED : ConfigReason::NO_WIFI_SETTINGS);
+    return;
+  }
 
   // Écran propre, puis écran de démarrage tenu à jour pendant que le réseau
   // fournit l'heure et les messages MQTT retenus : le premier affichage de la
@@ -1342,6 +1551,8 @@ void setup() {
   bool mqttSeen = false;
   bool bootComplete = false;
   while (millis() - bootStart < BOOT_NETWORK_WAIT_MS) {
+    serviceDoubleResetWindow();
+    webPortalLoop();
     serviceNetwork();
     if (gMqttClient.connected() && !mqttSeen) {
       mqttSeen = true;
@@ -1377,6 +1588,13 @@ void setup() {
   updateSplashScreen();
   delay(BOOT_SPLASH_FINAL_MS);
 
+  if (WiFi.status() != WL_CONNECTED) {
+    // Sans WiFi, l'écran principal resterait vide : proposer de corriger les
+    // réglages, tout en réessayant le réseau en arrière-plan.
+    enterConfigMode(ConfigReason::WIFI_UNREACHABLE);
+    return;
+  }
+
   updateDateTimeFromClock();
   updateMoonData();
   updateTideForecastFromStoredEvents();
@@ -1387,7 +1605,17 @@ void setup() {
 }
 
 void loop() {
+  serviceDoubleResetWindow();
+  webPortalLoop();
   serviceNetwork();
+
+  if (gConfigReason != ConfigReason::NONE) {
+    if (gConfigReason == ConfigReason::WIFI_UNREACHABLE && WiFi.status() == WL_CONNECTED) {
+      leaveConfigMode();
+    }
+    delay(20);
+    return;
+  }
 
   // L'horloge est relue souvent et le rafraîchissement suit le changement de
   // minute : l'affichage reste calé sur la minute réelle même après une
@@ -1398,7 +1626,8 @@ void loop() {
     refreshDirtySections();
   }
 
-  delay(200);
+  // Boucle courte : le serveur web doit répondre sans attendre.
+  delay(20);
 }
 
 // Maintenance réseau non bloquante : au plus une tentative de connexion MQTT
@@ -1412,26 +1641,37 @@ void serviceNetwork() {
   static bool wifiWasConnected = false;
   const unsigned long nowMs = millis();
 
+  if (gConfig.wifiSsid[0] == '\0') {
+    return;  // aucun réseau configuré : seul le point d'accès fonctionne
+  }
+
   if (!wifiStarted) {
     wifiStarted = true;
-    WiFi.mode(WIFI_STA);
+    WiFi.mode(webPortalAccessPointActive() ? WIFI_AP_STA : WIFI_STA);
+    WiFi.setHostname(gConfig.hostname);
     WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.begin(gConfig.wifiSsid, gConfig.wifiPassword);
     wifiLostSinceMs = nowMs;
     STATION_LOG_PRINT("Connexion WiFi à ");
-    STATION_LOG_PRINTLN(WIFI_SSID);
+    STATION_LOG_PRINTLN(gConfig.wifiSsid);
   }
 
   if (WiFi.status() != WL_CONNECTED) {
+    // Point d'accès ouvert faute de WiFi : les tentatives de connexion font
+    // changer la radio de canal et coupent le téléphone connecté. On espace
+    // donc les essais, et on n'essaie pas quand quelqu'un est connecté.
+    const bool fallbackAccessPoint = gConfigReason == ConfigReason::WIFI_UNREACHABLE;
+    const unsigned long retryAfterMs = fallbackAccessPoint ? CONFIG_MODE_WIFI_RETRY_MS : WIFI_FORCE_RECONNECT_AFTER_MS;
     if (wifiWasConnected) {
       wifiWasConnected = false;
       wifiLostSinceMs = nowMs;
       STATION_LOG_PRINTLN("WiFi perdu");
-    } else if (nowMs - wifiLostSinceMs >= WIFI_FORCE_RECONNECT_AFTER_MS) {
+    } else if (nowMs - wifiLostSinceMs >= retryAfterMs &&
+               (!fallbackAccessPoint || webPortalAccessPointClients() == 0)) {
       // Filet de sécurité si la reconnexion automatique ne reprend pas.
       wifiLostSinceMs = nowMs;
       WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      WiFi.begin(gConfig.wifiSsid, gConfig.wifiPassword);
       STATION_LOG_PRINTLN("WiFi: reconnexion forcée");
     }
     return;
@@ -1464,7 +1704,7 @@ bool connectToMQTT() {
   static bool configured = false;
   if (!configured) {
     configured = true;
-    gMqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    gMqttClient.setServer(gConfig.mqttHost, gConfig.mqttPort);
     gMqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
     // 15 s par défaut : le broker coupait la station plusieurs fois par mois.
     gMqttClient.setKeepAlive(MQTT_KEEPALIVE_S);
@@ -1479,8 +1719,8 @@ bool connectToMQTT() {
   String clientId = "epd-station-";
   clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
   bool connected = false;
-  if (MQTT_USERNAME != nullptr && MQTT_USERNAME[0] != '\0') {
-    connected = gMqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD);
+  if (gConfig.mqttUser[0] != '\0') {
+    connected = gMqttClient.connect(clientId.c_str(), gConfig.mqttUser, gConfig.mqttPassword);
   } else {
     connected = gMqttClient.connect(clientId.c_str());
   }
@@ -1615,8 +1855,8 @@ void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
 // Flèche du vent dessinée en vectoriel (nette à toute taille), centrée sur
 // (centerX, centerY) et inscrite dans un carré de côté size. Le bearing
 // indique d'où vient le vent : la flèche pointe vers où il va (+180°).
-// WIND_ARROW_STYLE : 1 = flèche à hampe (par défaut), 0 = flèche de navigation
-// à encoche.
+// gConfig.windArrowStyle : 1 = flèche à hampe (par défaut), 0 = flèche de
+// navigation à encoche.
 void drawWindArrow(int centerX, int centerY, float bearingDegrees, int size) {
   if (isnan(bearingDegrees)) {
     return;
@@ -1637,14 +1877,14 @@ void drawWindArrow(int centerX, int centerY, float bearingDegrees, int size) {
     display.fillTriangle(px(ax, ay), py(ax, ay), px(bx, by), py(bx, by), px(cx, cy), py(cx, cy), GxEPD_BLACK);
   };
 
-#if WIND_ARROW_STYLE == 1
-  fillTri(0.0f, -1.0f, 0.62f, -0.15f, -0.62f, -0.15f);    // pointe
-  fillTri(-0.17f, -0.2f, 0.17f, -0.2f, 0.17f, 1.0f);      // hampe
-  fillTri(-0.17f, -0.2f, 0.17f, 1.0f, -0.17f, 1.0f);
-#else
-  fillTri(0.0f, -1.0f, 0.72f, 0.95f, 0.0f, 0.42f);        // moitié droite
-  fillTri(0.0f, -1.0f, 0.0f, 0.42f, -0.72f, 0.95f);       // moitié gauche
-#endif
+  if (gConfig.windArrowStyle == 1) {
+    fillTri(0.0f, -1.0f, 0.62f, -0.15f, -0.62f, -0.15f);  // pointe
+    fillTri(-0.17f, -0.2f, 0.17f, -0.2f, 0.17f, 1.0f);    // hampe
+    fillTri(-0.17f, -0.2f, 0.17f, 1.0f, -0.17f, 1.0f);
+  } else {
+    fillTri(0.0f, -1.0f, 0.72f, 0.95f, 0.0f, 0.42f);      // moitié droite
+    fillTri(0.0f, -1.0f, 0.0f, 0.42f, -0.72f, 0.95f);     // moitié gauche
+  }
 }
 
 bool loadForecastFromJson(const char* payload, size_t length) {
@@ -1656,7 +1896,7 @@ bool loadForecastFromJson(const char* payload, size_t length) {
   // champs utilisés divise par plusieurs la mémoire du document JSON.
   JsonDocument filter;
   for (const char* key : {"datetime", "time", "wind_bearing", "wind_speed", "wind_gust_speed", "condition"}) {
-    filter["weather.trelevern"]["forecast"][0][key] = true;
+    filter[gConfig.forecastEntity]["forecast"][0][key] = true;
     filter["forecast"][0][key] = true;
   }
 
@@ -1671,7 +1911,7 @@ bool loadForecastFromJson(const char* payload, size_t length) {
     return false;
   }
 
-  JsonVariant rootVariant = doc["weather.trelevern"];
+  JsonVariant rootVariant = doc[gConfig.forecastEntity];
   JsonObject root = rootVariant.isNull() ? doc.as<JsonObject>() : rootVariant.as<JsonObject>();
   JsonArray forecast = root["forecast"].as<JsonArray>();
   if (forecast.isNull() || forecast.size() == 0) {

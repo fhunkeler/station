@@ -2,12 +2,21 @@
 // des shims Arduino/GxEPD2 (dossier shim/), alimente les vrais parseurs avec
 // des payloads au format de Home Assistant et écrit l'image en PGM 400x300.
 //
-// Usage : preview <sortie.pgm> [empty|stale|splash|splashfail]
+// Usage : preview <sortie.pgm> [empty|stale|splash|splashfail|config]
 #include "../../src/main.cpp"
 
 SerialStub Serial;
 EspStub ESP;
 WiFiStub WiFi;
+
+// Portail web absent de la prévisualisation.
+void webPortalBegin() {}
+void webPortalLoop() {}
+void webPortalStartAccessPoint() {}
+void webPortalStopAccessPoint() {}
+bool webPortalAccessPointActive() { return false; }
+int webPortalAccessPointClients() { return 0; }
+String webPortalEscape(const char* text) { return String(text); }
 
 static std::string iso(time_t t) {
   char b[40];
@@ -79,19 +88,25 @@ static void feedSampleData(time_t now, bool staleFloor) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    fprintf(stderr, "usage: %s sortie.pgm [empty|stale|splash|splashfail]\n", argv[0]);
+    fprintf(stderr, "usage: %s sortie.pgm [empty|stale|splash|splashfail|config]\n", argv[0]);
     return 1;
   }
   const std::string mode = argc > 2 ? argv[2] : "";
   setenv("TZ", TZ_EUROPE_PARIS, 1);
   tzset();
   const time_t now = time(nullptr);
+  loadStationConfig();
+  buildMqttTopics();
   updateDateTimeFromClock();
   display.init(0);
   display.setRotation(0);
+  display.setTextWrap(false);
   updateMoonData();
 
-  if (mode == "splash") {
+  if (mode == "config") {
+    gConfigReason = ConfigReason::WIFI_UNREACHABLE;
+    showFullScreen(drawConfigScreenContent);
+  } else if (mode == "splash") {
     gBootSteps[BOOT_STEP_WIFI] = {"WiFi", STEP_DONE, "192.168.0.161"};
     gBootSteps[BOOT_STEP_MQTT] = {"Serveur MQTT", STEP_DONE, "192.168.0.248"};
     gBootSteps[BOOT_STEP_TIME] = {"Heure (NTP)", STEP_RUNNING, ""};

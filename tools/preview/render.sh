@@ -8,10 +8,13 @@ root=$(cd "$here/../.." && pwd)
 libs="$root/.pio/libdeps/lolin_d32"
 build="$root/.pio/preview"
 mkdir -p "$build"
+# La bibliothèque QRCode est en C antérieur à C23 (elle définit "bool").
+gcc -std=gnu11 -O1 -w -c "$libs/QRCode/src/qrcode.c" -o "$build/qrcode.o"
 g++ -std=gnu++17 -O1 -w -DARDUINO=100 -I"$here/shim" -I"$libs/Adafruit GFX Library" \
-    -I"$libs/ArduinoJson/src" -I"$root/include" \
-    "$here/preview.cpp" "$libs/Adafruit GFX Library/Adafruit_GFX.cpp" -o "$build/preview"
-for case in full:ecran stale:ecran_perime empty:ecran_vide splash:demarrage splashfail:demarrage_echec; do
+    -I"$libs/ArduinoJson/src" -I"$libs/QRCode/src" -I"$root/include" -I"$root/src" \
+    "$here/preview.cpp" "$root/src/station_config.cpp" "$libs/Adafruit GFX Library/Adafruit_GFX.cpp" \
+    "$build/qrcode.o" -o "$build/preview"
+for case in full:ecran stale:ecran_perime empty:ecran_vide splash:demarrage splashfail:demarrage_echec config:configuration; do
   mode=${case%%:*}
   name=${case#*:}
   [ "$mode" = full ] && arg="" || arg=$mode
