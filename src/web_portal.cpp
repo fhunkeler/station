@@ -17,6 +17,16 @@ unsigned long gRestartAtMs = 0;
 bool gRestartPending = false;
 
 constexpr uint8_t DNS_PORT = 53;
+
+#if ENABLE_STATION_LOGS
+void logRequest(const char* what) {
+  Serial.printf("[HTTP] %s %s %s (hôte %s, client %s)\n", what,
+                gServer.method() == HTTP_POST ? "POST" : "GET", gServer.uri().c_str(),
+                gServer.hostHeader().c_str(), gServer.client().remoteIP().toString().c_str());
+}
+#else
+void logRequest(const char*) {}
+#endif
 constexpr unsigned long RESTART_DELAY_MS = 1500;
 
 // ---------- Utilitaires HTML ----------
@@ -81,6 +91,9 @@ void appendInput(String& html, const char* label, const char* name, const char* 
   html += ">";
 }
 
+// Sujet MQTT : non vide, sans espace ni joker d'abonnement.
+const char* const TOPIC_FIELD_ATTRIBUTES = "required maxlength=\"63\" pattern=\"[^#+ ]+\"";
+
 // Champ mot de passe : la valeur enregistrée n'est jamais renvoyée au
 // navigateur, un champ vide la conserve.
 void appendPassword(String& html, const char* label, const char* name, bool isSet) {
@@ -89,24 +102,26 @@ void appendPassword(String& html, const char* label, const char* name, bool isSe
                     : "placeholder=\"aucun\" autocomplete=\"new-password\"");
 }
 
+// Réseaux trouvés par la dernière recherche. La recherche n'est jamais lancée
+// pendant une réponse : elle fait changer la radio de canal pendant 2 à 3 s
+// et coupe les téléphones connectés au point d'accès.
 void appendNetworkList(String& html) {
   html += "<datalist id=\"ssids\">";
   const int found = WiFi.scanComplete();
-  if (found > 0) {
-    for (int i = 0; i < found; ++i) {
-      html += "<option value=\"";
-      html += htmlEscape(WiFi.SSID(i).c_str());
-      html += "\">";
-      html += String(WiFi.RSSI(i));
-      html += " dBm</option>";
-    }
+  for (int i = 0; i < found; ++i) {
+    html += "<option value=\"";
+    html += htmlEscape(WiFi.SSID(i).c_str());
+    html += "\">";
+    html += String(WiFi.RSSI(i));
+    html += " dBm</option>";
   }
   html += "</datalist>";
-  // Relancer une recherche en arrière-plan pour la prochaine visite.
-  if (found != WIFI_SCAN_RUNNING) {
-    WiFi.scanDelete();
-    WiFi.scanNetworks(true);
-  }
+}
+
+// Recherche synchrone des réseaux WiFi (quelques secondes).
+void scanNetworks() {
+  WiFi.scanDelete();
+  WiFi.scanNetworks(false);
 }
 
 void sendPage(const String& message, bool isError, int code = 200) {
@@ -137,7 +152,8 @@ void sendPage(const String& message, bool isError, int code = 200) {
   appendPassword(html, "Mot de passe WiFi", "wifiPassword", gConfig.wifiPassword[0] != '\0');
   appendInput(html, "Nom de la station sur le réseau (.local)", "hostname", gConfig.hostname, "text",
               "maxlength=\"31\" pattern=\"[a-zA-Z0-9-]+\"");
-  html += "<p class=\"note\">Un mot de passe WiFi vide est conservé, sauf si le nom du réseau change.</p>";
+  html += "<p class=\"note\">Un mot de passe WiFi vide est conservé, sauf si le nom du réseau change. "
+          "<a href=\"/scan\">Rechercher les réseaux</a> (quelques secondes).</p>";
   html += "</section>";
 
   html += "<section><h2>Serveur MQTT</h2><div class=\"row\"><div>";
@@ -149,10 +165,6 @@ void sendPage(const String& message, bool isError, int code = 200) {
   html += "</div><div>";
   appendPassword(html, "Mot de passe", "mqttPassword", gConfig.mqttPassword[0] != '\0');
   html += "</div></div>";
-  appendInput(html, "Préfixe des sujets (préfixe/tide, préfixe/outdoor...)", "topicPrefix",
-              gConfig.topicPrefix, "text", "maxlength=\"31\"");
-  appendInput(html, "Entité météo de la prévision", "forecastEntity", gConfig.forecastEntity, "text",
-              "maxlength=\"47\"");
   html += "</section>";
 
   html += "<section><h2>Affichage</h2><div class=\"row\"><div>";
@@ -161,19 +173,34 @@ void sendPage(const String& message, bool isError, int code = 200) {
   appendInput(html, "Colonne 2", "labelGround", gConfig.labelGround, "text", "maxlength=\"12\"");
   html += "</div></div>";
   appendInput(html, "Colonne 3", "labelFloor", gConfig.labelFloor, "text", "maxlength=\"12\"");
-  html += "<div class=\"row\"><div>";
-  appendInput(html, "Mesure périmée après (heures)", "staleHours", String(gConfig.staleHours).c_str(),
-              "number", "min=\"1\" max=\"48\"");
-  html += "</div><div>";
   appendInput(html, "Nettoyage de l'écran à (heure)", "ghostHour", String(gConfig.ghostCleaningHour).c_str(),
               "number", "min=\"0\" max=\"23\"");
-  html += "</div></div>";
   html += "<label for=\"arrowStyle\">Flèche du vent</label><select id=\"arrowStyle\" name=\"arrowStyle\">";
   html += gConfig.windArrowStyle == 1 ? "<option value=\"1\" selected>" : "<option value=\"1\">";
   html += "Flèche à hampe</option>";
   html += gConfig.windArrowStyle == 0 ? "<option value=\"0\" selected>" : "<option value=\"0\">";
   html += "Flèche de navigation à encoche</option></select>";
   html += "</section>";
+
+  // Mode expert : replié par défaut, pour les réglages qui dépendent de la
+  // configuration de Home Assistant.
+  html += "<section><details><summary><h2 style=\"display:inline\">Mode expert</h2></summary>"
+          "<p class=\"note\">Sujets MQTT lus par la station. Ils doivent correspondre exactement à ceux "
+          "publiés par Home Assistant (sans # ni +).</p>";
+  appendInput(html, "Marées", "topicTide", gConfig.topicTide, "text", TOPIC_FIELD_ATTRIBUTES);
+  appendInput(html, "Extérieur (température, pression)", "topicOutdoor", gConfig.topicOutdoor, "text",
+              TOPIC_FIELD_ATTRIBUTES);
+  appendInput(html, "Colonne 2 (température, humidité)", "topicGround", gConfig.topicGround, "text",
+              TOPIC_FIELD_ATTRIBUTES);
+  appendInput(html, "Colonne 3 (température, humidité)", "topicFloor", gConfig.topicFloor, "text",
+              TOPIC_FIELD_ATTRIBUTES);
+  appendInput(html, "Prévision météo (vent)", "topicForecast", gConfig.topicForecast, "text",
+              TOPIC_FIELD_ATTRIBUTES);
+  appendInput(html, "Entité météo dans le message de prévision", "forecastEntity", gConfig.forecastEntity,
+              "text", "maxlength=\"47\"");
+  appendInput(html, "Mesure périmée après (heures, d'après updated_at)", "staleHours",
+              String(gConfig.staleHours).c_str(), "number", "min=\"1\" max=\"48\"");
+  html += "</details></section>";
 
   html += "<section><h2>Administration</h2>";
   appendInput(html, "Nouveau mot de passe de cette page (utilisateur : admin)", "adminPassword", "",
@@ -244,6 +271,19 @@ bool readText(const char* name, char* target, size_t size, String& error, const 
   return true;
 }
 
+// Un sujet lu par la station est un nom exact : les jokers MQTT (# et +)
+// feraient correspondre plusieurs sources à un même champ.
+bool readTopic(const char* name, char* target, size_t size, String& error, const char* label) {
+  if (!readText(name, target, size, error, label)) {
+    return false;
+  }
+  if (target[0] == '\0' || strpbrk(target, "#+ ") != nullptr) {
+    error = String(label) + " : sujet vide ou contenant #, + ou un espace.";
+    return false;
+  }
+  return true;
+}
+
 bool readNumber(const char* name, long minValue, long maxValue, long& out, String& error, const char* label) {
   const String value = gServer.arg(name);
   char* end = nullptr;
@@ -283,7 +323,11 @@ void handleSave() {
             readText("mqttHost", updated.mqttHost, sizeof(updated.mqttHost), error, "Adresse MQTT") &&
             readNumber("mqttPort", 1, 65535, port, error, "Port MQTT") &&
             readText("mqttUser", updated.mqttUser, sizeof(updated.mqttUser), error, "Utilisateur MQTT") &&
-            readText("topicPrefix", updated.topicPrefix, sizeof(updated.topicPrefix), error, "Préfixe") &&
+            readTopic("topicTide", updated.topicTide, sizeof(updated.topicTide), error, "Sujet des marées") &&
+            readTopic("topicOutdoor", updated.topicOutdoor, sizeof(updated.topicOutdoor), error, "Sujet extérieur") &&
+            readTopic("topicGround", updated.topicGround, sizeof(updated.topicGround), error, "Sujet colonne 2") &&
+            readTopic("topicFloor", updated.topicFloor, sizeof(updated.topicFloor), error, "Sujet colonne 3") &&
+            readTopic("topicForecast", updated.topicForecast, sizeof(updated.topicForecast), error, "Sujet prévision") &&
             readText("forecastEntity", updated.forecastEntity, sizeof(updated.forecastEntity), error, "Entité météo") &&
             readText("labelOutdoor", updated.labelOutdoor, sizeof(updated.labelOutdoor), error, "Colonne 1") &&
             readText("labelGround", updated.labelGround, sizeof(updated.labelGround), error, "Colonne 2") &&
@@ -341,6 +385,7 @@ void handleSave() {
 // ---------- Portail captif ----------
 
 void handleNotFound() {
+  logRequest("inconnue");
   // Sur le point d'accès, toute adresse inconnue renvoie vers la page de
   // réglages : c'est ce qui fait apparaître le portail sur un téléphone.
   if (gAccessPointActive) {
@@ -359,11 +404,23 @@ void handleNotFound() {
 
 void webPortalBegin() {
   gServer.on("/", HTTP_GET, []() {
+    logRequest("page");
     if (authorize()) {
       sendPage("", false);
     }
   });
-  gServer.on("/save", HTTP_POST, handleSave);
+  gServer.on("/save", HTTP_POST, []() {
+    logRequest("enregistrement");
+    handleSave();
+  });
+  gServer.on("/scan", HTTP_GET, []() {
+    logRequest("recherche");
+    if (authorize()) {
+      scanNetworks();
+      gServer.sendHeader("Location", "/", true);
+      gServer.send(302, "text/plain", "");
+    }
+  });
   gServer.on("/restart", HTTP_POST, []() {
     if (authorize()) {
       sendRestartPage("La station redémarre.");
@@ -377,7 +434,6 @@ void webPortalBegin() {
   });
   gServer.onNotFound(handleNotFound);
   gServer.begin();
-  WiFi.scanNetworks(true);
 }
 
 void webPortalLoop() {
@@ -402,6 +458,9 @@ void webPortalStartAccessPoint() {
   if (gAccessPointActive) {
     return;
   }
+  // Liste des réseaux préparée avant l'ouverture du point d'accès, quand
+  // aucun téléphone ne peut encore en souffrir.
+  scanNetworks();
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(accessPointName().c_str(), accessPointPassword().c_str());
   gDns.setErrorReplyCode(DNSReplyCode::NoError);

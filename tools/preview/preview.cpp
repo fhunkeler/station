@@ -96,7 +96,6 @@ int main(int argc, char** argv) {
   tzset();
   const time_t now = time(nullptr);
   loadStationConfig();
-  buildMqttTopics();
   updateDateTimeFromClock();
   display.init(0);
   display.setRotation(0);

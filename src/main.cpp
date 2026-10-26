@@ -110,14 +110,12 @@ constexpr unsigned long CONFIG_MODE_WIFI_RETRY_MS = 5UL * 60UL * 1000UL;
 constexpr unsigned long DOUBLE_RESET_WINDOW_MS = 10000UL;
 // Un horodatage antérieur à 2020 signifie que l'horloge n'a jamais été réglée.
 constexpr time_t MIN_VALID_EPOCH = 1577836800;
-// Sujets MQTT : <préfixe>/<suffixe>, le préfixe étant réglable.
-const char* const TOPIC_SUFFIXES[] = {"tide", "outdoor", "ground", "floor", "forecast"};
-char gTopicNames[5][48];
-const char* const TOPIC_TIDE = gTopicNames[0];
-const char* const TOPIC_OUTDOOR = gTopicNames[1];
-const char* const TOPIC_GROUND = gTopicNames[2];
-const char* const TOPIC_FLOOR = gTopicNames[3];
-const char* const TOPIC_FORECAST = gTopicNames[4];
+// Sujets MQTT : réglables un par un (gConfig, mode expert de la page web).
+const char* const TOPIC_TIDE = gConfig.topicTide;
+const char* const TOPIC_OUTDOOR = gConfig.topicOutdoor;
+const char* const TOPIC_GROUND = gConfig.topicGround;
+const char* const TOPIC_FLOOR = gConfig.topicFloor;
+const char* const TOPIC_FORECAST = gConfig.topicForecast;
 constexpr size_t MQTT_BUFFER_SIZE_BYTES = 32768;
 constexpr size_t MAX_PIXELS_MOON = MOON_ICON_SIZE * MOON_ICON_SIZE;
 constexpr size_t MAX_BITMAP_PIXELS = MAX_PIXELS_MOON;
@@ -187,12 +185,6 @@ bool gTideNeedsUpdate = false;
 // l'écran de démarrage.
 const char* const STATION_TOPICS[] = {TOPIC_TIDE, TOPIC_OUTDOOR, TOPIC_GROUND, TOPIC_FLOOR, TOPIC_FORECAST};
 constexpr int STATION_TOPIC_COUNT = sizeof(STATION_TOPICS) / sizeof(STATION_TOPICS[0]);
-
-void buildMqttTopics() {
-  for (int i = 0; i < STATION_TOPIC_COUNT; ++i) {
-    snprintf(gTopicNames[i], sizeof(gTopicNames[i]), "%s/%s", gConfig.topicPrefix, TOPIC_SUFFIXES[i]);
-  }
-}
 
 // Mode configuration : point d'accès ouvert et écran d'instructions affiché
 // à la place des mesures.
@@ -1315,6 +1307,12 @@ void drawConfigScreenContent() {
 // Ouvre le point d'accès de configuration et affiche ses instructions.
 void enterConfigMode(ConfigReason reason) {
   gConfigReason = reason;
+  if (reason == ConfigReason::WIFI_UNREACHABLE) {
+    // Plus de tentatives automatiques en continu : elles balaient les canaux
+    // et coupent le téléphone. serviceNetwork() réessaie de loin en loin.
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect();
+  }
   webPortalStartAccessPoint();
   STATION_LOG_PRINT("Mode configuration, point d'accès ");
   STATION_LOG_PRINTLN(accessPointName());
@@ -1519,7 +1517,6 @@ void setup() {
   tzset();
 
   loadStationConfig();
-  buildMqttTopics();
   const bool configRequested = consumeDoubleReset();
 
   display.init(DISPLAY_DIAG_BAUD);
@@ -1641,8 +1638,11 @@ void serviceNetwork() {
   static bool wifiWasConnected = false;
   const unsigned long nowMs = millis();
 
-  if (gConfig.wifiSsid[0] == '\0') {
-    return;  // aucun réseau configuré : seul le point d'accès fonctionne
+  // Aucun réseau configuré, ou mode configuration demandé : seul le point
+  // d'accès fonctionne. La radio est unique : en se connectant à la box, le
+  // point d'accès suivrait son canal et décrocherait le téléphone.
+  if (gConfig.wifiSsid[0] == '\0' || gConfigReason == ConfigReason::REQUESTED) {
+    return;
   }
 
   if (!wifiStarted) {

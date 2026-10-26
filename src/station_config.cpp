@@ -45,7 +45,11 @@ void applyDefaults(StationConfig& config) {
   config.mqttPort = 1883;
   copyText(config.mqttUser, sizeof(config.mqttUser), STATION_MQTT_USERNAME);
   copyText(config.mqttPassword, sizeof(config.mqttPassword), STATION_MQTT_PASSWORD);
-  copyText(config.topicPrefix, sizeof(config.topicPrefix), "station");
+  copyText(config.topicTide, sizeof(config.topicTide), "station/tide");
+  copyText(config.topicOutdoor, sizeof(config.topicOutdoor), "station/outdoor");
+  copyText(config.topicGround, sizeof(config.topicGround), "station/ground");
+  copyText(config.topicFloor, sizeof(config.topicFloor), "station/floor");
+  copyText(config.topicForecast, sizeof(config.topicForecast), "station/forecast");
   copyText(config.forecastEntity, sizeof(config.forecastEntity), "weather.trelevern");
   copyText(config.labelOutdoor, sizeof(config.labelOutdoor), "EXTÉRIEUR");
   copyText(config.labelGround, sizeof(config.labelGround), "RDC");
@@ -76,7 +80,11 @@ void loadStationConfig() {
   gConfig.mqttPort = prefs.getUShort("mqttPort", gConfig.mqttPort);
   loadText(prefs, "mqttUser", gConfig.mqttUser, sizeof(gConfig.mqttUser));
   loadText(prefs, "mqttPass", gConfig.mqttPassword, sizeof(gConfig.mqttPassword));
-  loadText(prefs, "topicPrefix", gConfig.topicPrefix, sizeof(gConfig.topicPrefix));
+  loadText(prefs, "topicTide", gConfig.topicTide, sizeof(gConfig.topicTide));
+  loadText(prefs, "topicOutdoor", gConfig.topicOutdoor, sizeof(gConfig.topicOutdoor));
+  loadText(prefs, "topicGround", gConfig.topicGround, sizeof(gConfig.topicGround));
+  loadText(prefs, "topicFloor", gConfig.topicFloor, sizeof(gConfig.topicFloor));
+  loadText(prefs, "topicForecast", gConfig.topicForecast, sizeof(gConfig.topicForecast));
   loadText(prefs, "forecast", gConfig.forecastEntity, sizeof(gConfig.forecastEntity));
   loadText(prefs, "lblOutdoor", gConfig.labelOutdoor, sizeof(gConfig.labelOutdoor));
   loadText(prefs, "lblGround", gConfig.labelGround, sizeof(gConfig.labelGround));
@@ -101,7 +109,11 @@ bool saveStationConfig() {
   ok &= prefs.putUShort("mqttPort", gConfig.mqttPort) > 0;
   ok &= prefs.putString("mqttUser", gConfig.mqttUser) == strlen(gConfig.mqttUser);
   ok &= prefs.putString("mqttPass", gConfig.mqttPassword) == strlen(gConfig.mqttPassword);
-  ok &= prefs.putString("topicPrefix", gConfig.topicPrefix) == strlen(gConfig.topicPrefix);
+  ok &= prefs.putString("topicTide", gConfig.topicTide) == strlen(gConfig.topicTide);
+  ok &= prefs.putString("topicOutdoor", gConfig.topicOutdoor) == strlen(gConfig.topicOutdoor);
+  ok &= prefs.putString("topicGround", gConfig.topicGround) == strlen(gConfig.topicGround);
+  ok &= prefs.putString("topicFloor", gConfig.topicFloor) == strlen(gConfig.topicFloor);
+  ok &= prefs.putString("topicForecast", gConfig.topicForecast) == strlen(gConfig.topicForecast);
   ok &= prefs.putString("forecast", gConfig.forecastEntity) == strlen(gConfig.forecastEntity);
   ok &= prefs.putString("lblOutdoor", gConfig.labelOutdoor) == strlen(gConfig.labelOutdoor);
   ok &= prefs.putString("lblGround", gConfig.labelGround) == strlen(gConfig.labelGround);

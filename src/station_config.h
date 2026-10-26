@@ -15,7 +15,12 @@ struct StationConfig {
   uint16_t mqttPort;
   char mqttUser[33];
   char mqttPassword[65];
-  char topicPrefix[32];     // "station" -> station/tide, station/outdoor...
+  // Sujets MQTT lus par la station, un par source (mode expert).
+  char topicTide[64];
+  char topicOutdoor[64];
+  char topicGround[64];
+  char topicFloor[64];
+  char topicForecast[64];
   char forecastEntity[48];  // clé racine du message de prévision
   // Affichage (libellés en UTF-8)
   char labelOutdoor[24];
