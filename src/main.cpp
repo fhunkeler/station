@@ -9,15 +9,13 @@
 #include <ctype.h>
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
-#include <Fonts/FreeSans18pt7b.h>
+#include <Fonts/FreeSansBold9pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold24pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 
 #include "moon_icons.h"
-#include "indoor_icons.h"
-#include "tide_icons.h"
 #include "wind_icons.h"
-#include "celsius_icon.h"
 #include "secrets.h"
 
 // Set ENABLE_STATION_LOGS to 0 at build time to strip Serial logs in production.
@@ -97,14 +95,6 @@ constexpr const char* NTP_SERVER_1 = "fr.pool.ntp.org";
 constexpr const char* NTP_SERVER_2 = "pool.ntp.org";
 constexpr const char* NTP_SERVER_3 = "time.google.com";
 
-const char* const FRENCH_DAY_ABBREVIATIONS[7] = {
-  "Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"
-};
-
-const char* const FRENCH_MONTH_ABBREVIATIONS[12] = {
-  "Jan", "Fev", "Mar", "Avr", "Mai", "Jun",
-  "Jul", "Aou", "Sep", "Oct", "Nov", "Dec"
-};
 const char* MQTT_HOST = STATION_MQTT_HOST;
 constexpr uint16_t MQTT_PORT = 1883;
 const char* MQTT_USERNAME = STATION_MQTT_USERNAME;
@@ -128,11 +118,7 @@ constexpr const char* TOPIC_FLOOR = "station/floor";
 constexpr const char* TOPIC_FORECAST = "station/forecast";
 constexpr size_t MQTT_BUFFER_SIZE_BYTES = 32768;
 constexpr size_t MAX_PIXELS_MOON = MOON_ICON_SIZE * MOON_ICON_SIZE;
-constexpr size_t MAX_PIXELS_ROOM = ROOM_ICON_SIZE * ROOM_ICON_SIZE;
-constexpr size_t MAX_PIXELS_TIDE = TIDE_ICON_SIZE * TIDE_ICON_SIZE;
-constexpr size_t MAX_BITMAP_PIXELS = (MAX_PIXELS_MOON > MAX_PIXELS_ROOM)
-                                     ? ((MAX_PIXELS_MOON > MAX_PIXELS_TIDE) ? MAX_PIXELS_MOON : MAX_PIXELS_TIDE)
-                                     : ((MAX_PIXELS_ROOM > MAX_PIXELS_TIDE) ? MAX_PIXELS_ROOM : MAX_PIXELS_TIDE);
+constexpr size_t MAX_BITMAP_PIXELS = MAX_PIXELS_MOON;
 constexpr size_t MAX_MONO_BITMAP_BYTES = MAX_BITMAP_PIXELS / 8;
 constexpr double SYNODIC_MONTH_DAYS = 29.530588853;
 constexpr double KNOWN_NEW_MOON_JD = 2451550.1;  // 6 janvier 2000 18:14 UTC
@@ -174,28 +160,19 @@ struct Rect {
   int16_t h;
 };
 
-struct LayoutMetrics {
-  Rect header;
-  Rect headerSeparator;
-  Rect tide;
-  Rect exterior;
-  Rect centralSeparator;
-  Rect middleSeparator;
-  Rect interior;
-  Rect interiorSeparator;
-};
+// Trois bandes pleine largeur, chacune rafraîchie par une fenêtre partielle.
+// Les ordonnées restent indépendantes de l'alignement sur 8 px, qui ne
+// concerne que x et w (toujours 0 et 400 ici).
+constexpr int16_t SCREEN_MARGIN = 12;
+constexpr Rect HEADER_AREA = {0, 0, 400, 64};
+constexpr Rect TIDE_AREA = {0, 64, 400, 120};
+constexpr Rect BOTTOM_AREA = {0, 184, 400, 116};
 
-LayoutMetrics gLayout;
-constexpr int16_t GRID_COLUMN_MARGIN = 24;
-
-int16_t leftColumnAnchor() {
-  return GRID_COLUMN_MARGIN;
-}
-
-int16_t rightColumnAnchor() {
-  return display.width() - GRID_COLUMN_MARGIN;
-}
-
+// Fenêtre de la courbe de marée autour de l'heure courante.
+constexpr time_t TIDE_CHART_PAST_S = 6 * 3600;
+constexpr time_t TIDE_CHART_FUTURE_S = 18 * 3600;
+// Le repère "maintenant" glisse d'environ 1,6 px toutes les 10 minutes.
+constexpr int TIDE_CHART_REFRESH_MINUTES = 10;
 WiFiClient gMqttWiFiClient;
 PubSubClient gMqttClient(gMqttWiFiClient);
 bool gExteriorNeedsUpdate = false;
@@ -205,101 +182,15 @@ bool gTideNeedsUpdate = false;
 
 // ========== FONCTIONS D'AFFICHAGE ==========
 
-Rect makeRect(int16_t x, int16_t y, int16_t w, int16_t h) {
-  Rect rect = {x, y, w, h};
-  return rect;
-}
-
-void computeLayout() {
-  const int16_t screenW = display.width();
-  const int16_t screenH = display.height();
-
-  const int16_t margin = 8;
-  const int16_t columnGap = 16;
-  const int16_t headerContentHeight = 90;
-  const int16_t headerSeparatorOffset = 10;
-  const int16_t headerSeparatorThickness = 4;
-  const int16_t headerContentPadding = 8;
-  const int16_t middleSeparatorPadding = 8;
-  const int16_t middleSeparatorThickness = 4;
-  const int16_t partialAlignment = 8;
-  const int16_t bottomSectionHeight = 70;
-  const int16_t bottomMargin = 10;
-
-  gLayout.headerSeparator = makeRect((screenW * 1) / 10, headerContentHeight + headerSeparatorOffset,
-                                     (screenW * 8) / 10, headerSeparatorThickness);
-
-  const int16_t headerHeight = gLayout.headerSeparator.y + gLayout.headerSeparator.h;
-  gLayout.header = makeRect(0, 0, screenW, headerHeight);
-
-  const int16_t contentY = headerHeight + headerContentPadding;
-  const int16_t availableWidth = screenW - 2 * margin;
-  const int16_t baseWidth = availableWidth - columnGap;
-  const int16_t tideWidth = baseWidth / 2;
-  const int16_t exteriorWidth = baseWidth - tideWidth;
-
-  const int16_t bottomSectionY = screenH - bottomSectionHeight - bottomMargin;
-  gLayout.tide = makeRect(margin, bottomSectionY, tideWidth, bottomSectionHeight);
-  gLayout.exterior = makeRect(gLayout.tide.x + tideWidth + columnGap, bottomSectionY, exteriorWidth, bottomSectionHeight);
-
-  const int16_t centralSeparatorHeight = (bottomSectionHeight > 0) ? (bottomSectionHeight * 4) / 5 : 0;
-  const int16_t centralSeparatorWidth = 16;
-  const int16_t centralSeparatorX = gLayout.tide.x + tideWidth + columnGap / 2 - centralSeparatorWidth / 2;
-  const int16_t centralSeparatorY = (centralSeparatorHeight > 0)
-                                    ? bottomSectionY + (bottomSectionHeight - centralSeparatorHeight) / 2
-                                    : bottomSectionY;
-  gLayout.centralSeparator = makeRect(centralSeparatorX, centralSeparatorY, centralSeparatorWidth, centralSeparatorHeight);
-
-  const int16_t middleSeparatorY = bottomSectionY - middleSeparatorPadding - middleSeparatorThickness;
-  gLayout.middleSeparator = makeRect((screenW * 1) / 10, middleSeparatorY, (screenW * 8) / 10, middleSeparatorThickness);
-
-  int16_t contentBottom = middleSeparatorY - middleSeparatorPadding;
-  if (contentBottom < contentY) {
-    contentBottom = contentY;
-  }
-
-  int16_t contentHeight = contentBottom - contentY;
-  if (contentHeight < 0) {
-    contentHeight = 0;
-  }
-  if (contentHeight > 0 && (contentHeight % partialAlignment) != 0) {
-    contentHeight -= contentHeight % partialAlignment;
-  }
-
-  contentBottom = contentY + contentHeight;
-
-  gLayout.interior = makeRect(margin, contentY, availableWidth, contentHeight);
-
-  const int16_t interiorSeparatorHeight = (contentHeight > 0) ? (contentHeight * 4) / 5 : 0;
-  const int16_t interiorSeparatorWidth = 16;
-  const int16_t interiorSeparatorX = gLayout.interior.x + gLayout.interior.w / 2 - interiorSeparatorWidth / 2;
-  const int16_t interiorSeparatorY = (interiorSeparatorHeight > 0)
-                                     ? gLayout.interior.y + (contentHeight - interiorSeparatorHeight) / 2
-                                     : gLayout.interior.y;
-  gLayout.interiorSeparator = makeRect(interiorSeparatorX, interiorSeparatorY, interiorSeparatorWidth, interiorSeparatorHeight);
-}
+enum TextAlign { ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT };
 
 void clearArea(const Rect& area) {
   display.fillRect(area.x, area.y, area.w, area.h, GxEPD_WHITE);
 }
 
-void drawThickSeparator(const Rect& rect) {
-  display.fillRect(rect.x, rect.y, rect.w, rect.h, GxEPD_BLACK);
-}
-
-void drawVerticalSeparator(const Rect& rect) {
-  const int16_t thickness = min<int16_t>(rect.w, 2);
-  const int16_t lineX = rect.x + (rect.w - thickness) / 2;
-  display.fillRect(lineX, rect.y, thickness, rect.h, GxEPD_BLACK);
-}
-
 void updateHeaderSection();
 void updateTideSection();
-void updateExteriorSection();
-void updateCentralSeparator();
-void updateMiddleSeparator();
-void updateInteriorSection();
-void updateInteriorSeparator();
+void updateBottomSection();
 bool updateTideForecastFromStoredEvents();
 void serviceNetwork();
 bool connectToMQTT();
@@ -682,419 +573,344 @@ void drawMoonPhase(int centerX, int centerY, int phase) {
   drawBitmapBlackOnWhite(topLeftX, topLeftY, bitmap, MOON_ICON_SIZE, MOON_ICON_SIZE);
 }
 
-void drawGroundFloorIconCentered(int cx, int cy) {
-  int topLeftX = cx - (ROOM_ICON_SIZE / 2);
-  int topLeftY = cy - (ROOM_ICON_SIZE / 2);
-  drawBitmapBlackOnWhite(topLeftX, topLeftY, epd_bitmap_couch, ROOM_ICON_SIZE, ROOM_ICON_SIZE);
+// Écrit text avec la police courante, aligné horizontalement sur x.
+// Renvoie l'abscisse du bord droit du texte.
+int printAligned(const char* text, int x, int baseline, TextAlign align) {
+  int16_t bx, by;
+  uint16_t bw, bh;
+  display.getTextBounds(text, 0, 0, &bx, &by, &bw, &bh);
+  int left = x;
+  if (align == ALIGN_CENTER) {
+    left = x - static_cast<int>(bw) / 2;
+  } else if (align == ALIGN_RIGHT) {
+    left = x - static_cast<int>(bw);
+  }
+  display.setCursor(left - bx, baseline);
+  display.print(text);
+  return left + bw;
 }
 
-void drawUpperFloorIconCentered(int cx, int cy) {
-  int topLeftX = cx - (ROOM_ICON_SIZE / 2);
-  int topLeftY = cy - (ROOM_ICON_SIZE / 2);
-  drawBitmapBlackOnWhite(topLeftX, topLeftY, epd_bitmap_stairs, ROOM_ICON_SIZE, ROOM_ICON_SIZE);
+// Comme printAligned, mais sur un fond blanc pour rester lisible par-dessus
+// la courbe de marée. Le texte est contenu dans [minX, maxX].
+void printLabel(const char* text, int x, int baseline, TextAlign align, int minX, int maxX) {
+  int16_t bx, by;
+  uint16_t bw, bh;
+  display.getTextBounds(text, 0, 0, &bx, &by, &bw, &bh);
+  int left = x;
+  if (align == ALIGN_CENTER) {
+    left = x - static_cast<int>(bw) / 2;
+  } else if (align == ALIGN_RIGHT) {
+    left = x - static_cast<int>(bw);
+  }
+  left = constrain(left, minX, maxX - static_cast<int>(bw));
+  display.fillRect(left - 2, baseline + by - 2, bw + 4, bh + 4, GxEPD_WHITE);
+  display.setCursor(left - bx, baseline);
+  display.print(text);
 }
 
-void drawCelsiusIcon(int topLeftX, int topLeftY, const CelsiusIconAsset& icon) {
-  drawBitmapBlackOnWhite(topLeftX, topLeftY, icon.bitmap, icon.size, icon.size);
+// Température en gros avec un signe degré dessiné (les polices GFX n'ont
+// pas de "°"). "--.-" si la valeur est inconnue.
+void drawTemperature(float value, int x, int baseline, TextAlign align, const GFXfont* font, int degreeRadius) {
+  char text[8];
+  if (isnan(value)) {
+    strcpy(text, "--.-");
+  } else {
+    snprintf(text, sizeof(text), "%.1f", value);
+  }
+  display.setFont(font);
+  int16_t bx, by;
+  uint16_t bw, bh;
+  display.getTextBounds(text, 0, 0, &bx, &by, &bw, &bh);
+  const int degreeWidth = 2 * degreeRadius + 3;
+  const int totalWidth = static_cast<int>(bw) + degreeWidth;
+  int left = x;
+  if (align == ALIGN_CENTER) {
+    left = x - totalWidth / 2;
+  } else if (align == ALIGN_RIGHT) {
+    left = x - totalWidth;
+  }
+  display.setCursor(left - bx, baseline);
+  display.print(text);
+  const int cx = left + bw + 3 + degreeRadius;
+  const int cy = baseline + by + degreeRadius;
+  display.drawCircle(cx, cy, degreeRadius, GxEPD_BLACK);
+  display.drawCircle(cx, cy, degreeRadius - 1, GxEPD_BLACK);
 }
+
+const char* compassPoint(float bearingDegrees) {
+  static const char* const POINTS[16] = {
+    "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+    "S", "SSO", "SO", "OSO", "O", "ONO", "NO", "NNO"
+  };
+  int index = static_cast<int>(floorf(bearingDegrees / 22.5f + 0.5f)) % 16;
+  if (index < 0) {
+    index += 16;
+  }
+  return POINTS[index];
+}
+
+const char* const FRENCH_DAY_NAMES[7] = {
+  "Dimanche", "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi"
+};
+
+const char* const FRENCH_MONTH_NAMES[12] = {
+  "janvier", "fevrier", "mars", "avril", "mai", "juin",
+  "juillet", "aout", "septembre", "octobre", "novembre", "decembre"
+};
 
 void drawHeaderContent() {
   display.setTextColor(GxEPD_BLACK);
-  const int leftAnchor = leftColumnAnchor();
-  const int rightAnchor = rightColumnAnchor();
 
   char timeStr[6] = "--:--";
-  char dateStr[24] = "";
   if (gTimeValid) {
     snprintf(timeStr, sizeof(timeStr), "%02d:%02d", gNow.tm_hour, gNow.tm_min);
-    snprintf(dateStr, sizeof(dateStr), "%s %d %s %d",
-             FRENCH_DAY_ABBREVIATIONS[gNow.tm_wday % 7], gNow.tm_mday,
-             FRENCH_MONTH_ABBREVIATIONS[gNow.tm_mon % 12], gNow.tm_year + 1900);
+  }
+  display.setFont(&FreeSansBold24pt7b);
+  const int timeRight = printAligned(timeStr, SCREEN_MARGIN, 47, ALIGN_LEFT);
+
+  if (gTimeValid) {
+    char dateStr[24];
+    snprintf(dateStr, sizeof(dateStr), "%d %s", gNow.tm_mday, FRENCH_MONTH_NAMES[gNow.tm_mon % 12]);
+    const int dateX = timeRight + 14;
+    display.setFont(&FreeSansBold12pt7b);
+    printAligned(FRENCH_DAY_NAMES[gNow.tm_wday % 7], dateX, 26, ALIGN_LEFT);
+    display.setFont(&FreeSans12pt7b);
+    printAligned(dateStr, dateX, 48, ALIGN_LEFT);
   }
 
-  display.setFont(&FreeSansBold24pt7b);
-  display.setCursor(leftAnchor, 55);
-  display.print(timeStr);
-
-  display.setFont(&FreeSans12pt7b);
-  display.setCursor(leftAnchor + 4, 78);
-  display.print(dateStr);
-
-  const int headerTop = gLayout.header.y;
-  const int headerHeight = gLayout.headerSeparator.y - gLayout.header.y;
-  const int moonCenterX = rightAnchor - (MOON_ICON_SIZE / 2);
-  const int iconDiameter = MOON_ICON_SIZE;
-  const int textSpacing = 6;
-
-  display.setFont(&FreeSans9pt7b);
-  int16_t tbx, tby; uint16_t tbw, tbh;
-  String moonText = (moonIllumination >= 0) ? (String(moonIllumination) + "%") : String("--%");
-  display.getTextBounds(moonText, 0, 0, &tbx, &tby, &tbw, &tbh);
-
-  int blockHeight = iconDiameter + textSpacing + tbh;
-  int blockTop = headerTop + (headerHeight - blockHeight) / 2;
-  int moonCenterY = blockTop + iconDiameter / 2;
-
+  const int moonCenterX = display.width() - SCREEN_MARGIN - MOON_ICON_SIZE / 2;
+  const int moonCenterY = 30;
   if (moonIllumination >= 0) {
     drawMoonPhase(moonCenterX, moonCenterY, moonPhase);
+    char moonText[16];
+    snprintf(moonText, sizeof(moonText), "%d%%", moonIllumination);
+    display.setFont(&FreeSans9pt7b);
+    printAligned(moonText, moonCenterX - MOON_ICON_SIZE / 2 - 6, moonCenterY + 6, ALIGN_RIGHT);
   }
 
-  int textBaseline = blockTop + iconDiameter + textSpacing - tby;
-  int textX = moonCenterX - (tbw / 2) - tbx;
-  display.setCursor(textX, textBaseline);
-  display.print(moonText);
-
-  drawThickSeparator(gLayout.headerSeparator);
+  display.fillRect(SCREEN_MARGIN, HEADER_AREA.y + HEADER_AREA.h - 3, display.width() - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
 }
 
-void drawTidePanel(const Rect& area) {
-  const int originX = area.x;
-  const int originY = area.y;
-  const int w = area.w;
-  const int h = area.h;
-
-  // Marée: 0 = descendante (LOW), 1 = montante (HIGH). Le sens ne dépend que
-  // de la validité de la prochaine marée, pas de la présence d'un coefficient.
-  const bool tideKnown = nextTideEpoch != 0;
-  const unsigned char* iconBitmap = tide_bitmap_allArray[isTideRising ? 1 : 0];
-  const int iconSize = TIDE_ICON_SIZE;
-  const int iconSpacing = 12;
-  const int textSpacing = 6;
-  const int prevSpacing = 4;
-  const int coefSpacingAboveIcon = 6;
-
-  String timeStr = nextTideTime.length() > 0 ? nextTideTime : "--:--";
-  String coefStr = (tideCoefficient >= 0) ? (String("Coef ") + String(tideCoefficient)) : String("Coef --");
-  String prevStr = (prevTideEpoch > 0) ? prevTideTime : String("--:--");
-
-  display.setFont(&FreeSans18pt7b);
-  int16_t timeTbx, timeTby; uint16_t timeTbw, timeTbh;
-  display.getTextBounds(timeStr, 0, 0, &timeTbx, &timeTby, &timeTbw, &timeTbh);
-
-  display.setFont(&FreeSans9pt7b);
-  int16_t prevTbx, prevTby; uint16_t prevTbw, prevTbh;
-  display.getTextBounds(prevStr, 0, 0, &prevTbx, &prevTby, &prevTbw, &prevTbh);
-
-  display.setFont(&FreeSans9pt7b);
-  int16_t coefTbx, coefTby; uint16_t coefTbw, coefTbh;
-  display.getTextBounds(coefStr, 0, 0, &coefTbx, &coefTby, &coefTbw, &coefTbh);
-
-  int textBlockHeight = prevTbh + prevSpacing + timeTbh;
-  int textBlockWidth = max(prevTbw, timeTbw);
-  int iconBlockWidth = max(iconSize, static_cast<int>(coefTbw));
-  int iconBlockHeight = coefTbh + coefSpacingAboveIcon + iconSize;
-  int contentHeight = max(iconBlockHeight, textBlockHeight);
-  int contentTop = originY + (h - contentHeight) / 2;
-  int textLeft = leftColumnAnchor();
-  if (textLeft < originX + 2) {
-    textLeft = originX + 2;
-  }
-  int iconBlockLeft = textLeft + textBlockWidth + iconSpacing;
-  int maxRight = originX + w - 2;
-  int iconBlockTop = contentTop + (contentHeight - iconBlockHeight) / 2;
-  int iconRightEdge = iconBlockLeft + iconBlockWidth;
-  if (iconRightEdge > maxRight) {
-    int shift = iconRightEdge - maxRight;
-    textLeft -= shift;
-    if (textLeft < originX + 2) {
-      textLeft = originX + 2;
+// Hauteur d'eau estimée à l'instant t par la règle du cosinus entre les deux
+// étales qui l'encadrent. Faux si t sort des données connues.
+bool tideHeightAt(time_t t, float& outHeight) {
+  for (int i = 0; i + 1 < gTideEventCount; ++i) {
+    const TideEvent& a = gTideEvents[i];
+    const TideEvent& b = gTideEvents[i + 1];
+    if (t < a.ts || t > b.ts || b.ts <= a.ts || isnan(a.height) || isnan(b.height)) {
+      continue;
     }
-    iconBlockLeft = textLeft + textBlockWidth + iconSpacing;
+    const float progress = static_cast<float>(t - a.ts) / static_cast<float>(b.ts - a.ts);
+    outHeight = a.height + (b.height - a.height) * (1.0f - cosf(PI * progress)) / 2.0f;
+    return true;
   }
-  int textTop = contentTop + (contentHeight - textBlockHeight) / 2;
-
-  int iconLeft = iconBlockLeft + (iconBlockWidth - iconSize) / 2;
-  int iconTop = iconBlockTop + coefTbh + coefSpacingAboveIcon;
-  if (tideKnown) {
-    drawBitmapBlackOnWhite(iconLeft, iconTop, iconBitmap, iconSize, iconSize);
-  }
-
-  int currentY = textTop;
-
-  display.setFont(&FreeSans9pt7b);
-  int prevBaseline = currentY - prevTby;
-  int prevCursorX = textLeft - prevTbx;
-  display.setCursor(prevCursorX, prevBaseline);
-  display.print(prevStr);
-  currentY += prevTbh + prevSpacing;
-
-  display.setFont(&FreeSans18pt7b);
-  int timeBaseline = currentY - timeTby;
-  int timeCursorX = textLeft - timeTbx;
-  display.setCursor(timeCursorX, timeBaseline);
-  display.print(timeStr);
-  currentY += timeTbh;
-
-  display.setFont(&FreeSans9pt7b);
-  int coefBaseline = iconBlockTop - coefTby;
-  int coefCursorX = iconBlockLeft + (iconBlockWidth - coefTbw) / 2 - coefTbx;
-  display.setCursor(coefCursorX, coefBaseline);
-  display.print(coefStr);
+  return false;
 }
 
-void drawExteriorPanel(const Rect& area) {
-  const int originX = area.x;
-  const int originY = area.y;
-  const int w = area.w;
-  const int h = area.h;
+void drawTideContent() {
+  const int left = SCREEN_MARGIN;
+  const int right = display.width() - SCREEN_MARGIN;
+  const int titleBaseline = TIDE_AREA.y + 17;
+  const int curveTop = TIDE_AREA.y + 48;     // ordonnée de la plus haute mer
+  const int curveBottom = TIDE_AREA.y + 90;  // ordonnée de la plus basse mer
+  const int fillBottom = curveBottom + 4;
 
-  const CelsiusIconAsset& exteriorIcon = CELSIUS_ICON_MEDIUM;
-
-  display.setFont(&FreeSans18pt7b);
-  String tempStr = isnan(tempExterior) ? String("--.-") : String(tempExterior, 1);
-  int16_t tbx, tby;
-  uint16_t tbw, tbh;
-  display.getTextBounds(tempStr, 0, 0, &tbx, &tby, &tbw, &tbh);
-
-  display.setFont(&FreeSans12pt7b);
-  String pressureStr = (pressureAtmospheric >= 0) ? (String(pressureAtmospheric) + " hPa") : String("-- hPa");
-  int16_t tbx2, tby2; uint16_t tbw2, tbh2;
-  display.getTextBounds(pressureStr, 0, 0, &tbx2, &tby2, &tbw2, &tbh2);
-
-  display.setFont(&FreeSans9pt7b);
-  String windSpeedStr = isnan(windSpeedKmh) ? String("-- km/h") : (String(windSpeedKmh, 0) + String(" km/h"));
-  int16_t wsTbx, wsTby; uint16_t wsTbw, wsTbh;
-  display.getTextBounds(windSpeedStr, 0, 0, &wsTbx, &wsTby, &wsTbw, &wsTbh);
-
-  const int lineSpacing = 10;
-  const int arrowBoxSize = 52;
-  const int arrowSpacing = 12;
-  const int windLabelSpacing = 6;
-
-  int tempLineWidth = tbw + exteriorIcon.size + CELSIUS_ICON_PADDING;
-  int textBlockWidth = max(tempLineWidth, static_cast<int>(tbw2));
-  int textBlockHeight = tbh + lineSpacing + tbh2;
-  int arrowBlockWidth = max(arrowBoxSize, static_cast<int>(wsTbw));
-  int arrowBlockHeight = wsTbh + windLabelSpacing + arrowBoxSize;
-  int contentWidth = arrowBlockWidth + arrowSpacing + textBlockWidth;
-  if (contentWidth > w) {
-    contentWidth = w;
-  }
-  int blockHeight = max(arrowBlockHeight, textBlockHeight);
-  int blockTop = originY + (h - blockHeight) / 2;
-  int rightAnchor = rightColumnAnchor();
-  if (rightAnchor > originX + w - 2) {
-    rightAnchor = originX + w - 2;
-  }
-  int blockLeft = rightAnchor - contentWidth;
-  if (blockLeft < originX + 2) {
-    blockLeft = originX + 2;
-    rightAnchor = blockLeft + contentWidth;
+  display.setTextColor(GxEPD_BLACK);
+  time_t nowTs = 0;
+  if (!currentEpoch(nowTs) || nextTideEpoch == 0) {
+    display.setFont(&FreeSansBold9pt7b);
+    printAligned("MAREE", left, titleBaseline, ALIGN_LEFT);
+    display.setFont(&FreeSans9pt7b);
+    printAligned("Donnees indisponibles", display.width() / 2, TIDE_AREA.y + 70, ALIGN_CENTER);
+    return;
   }
 
-  int arrowBlockLeft = blockLeft;
-  int arrowBlockTop = blockTop + (blockHeight - arrowBlockHeight) / 2;
-  int arrowCenterX = arrowBlockLeft + arrowBlockWidth / 2;
-  int arrowCenterY = arrowBlockTop + wsTbh + windLabelSpacing + arrowBoxSize / 2;
-  drawWindArrow(arrowCenterX, arrowCenterY, windBearingDegrees, arrowBoxSize - 10);
+  display.setFont(&FreeSansBold9pt7b);
+  printAligned(isTideRising ? "MAREE MONTANTE" : "MAREE DESCENDANTE", left, titleBaseline, ALIGN_LEFT);
 
-  display.setFont(&FreeSans9pt7b);
-  int windBaseline = arrowBlockTop - wsTby;
-  int windCursorX = arrowBlockLeft + (arrowBlockWidth - wsTbw) / 2 - wsTbx;
-  display.setCursor(windCursorX, windBaseline);
-  display.print(windSpeedStr);
-
-  int textTop = blockTop + (blockHeight - textBlockHeight) / 2;
-  int tempTextRightEdge = rightAnchor - exteriorIcon.size - CELSIUS_ICON_PADDING;
-  int tempCursorX = tempTextRightEdge - tbw - tbx;
-
-  display.setFont(&FreeSans18pt7b);
-  int baselineTemp = textTop - tby;
-  display.setCursor(tempCursorX, baselineTemp);
-  display.print(tempStr);
-  int tempIconX = rightAnchor - exteriorIcon.size;
-  if (tempIconX < originX + 2) {
-    tempIconX = originX + 2;
+  // Le coefficient se rapporte à la pleine mer : prendre la prochaine.
+  int coef = -1;
+  for (int i = 0; i < gTideEventCount; ++i) {
+    if (gTideEvents[i].ts > nowTs && strcmp(gTideEvents[i].type, "HIGH") == 0) {
+      coef = gTideEvents[i].coeff;
+      break;
+    }
   }
-  int tempIconTop = baselineTemp + tby;
-  drawCelsiusIcon(tempIconX, tempIconTop, exteriorIcon);
+  if (coef < 0) {
+    coef = tideCoefficient;
+  }
+  char coefStr[16];
+  if (coef >= 0) {
+    snprintf(coefStr, sizeof(coefStr), "Coef %d", coef);
+  } else {
+    strcpy(coefStr, "Coef --");
+  }
+  printAligned(coefStr, right, titleBaseline, ALIGN_RIGHT);
 
-  display.setFont(&FreeSans12pt7b);
-  int baselinePressure = textTop + tbh + lineSpacing - tby2;
-  int pressureCursorX = rightAnchor - tbw2 - tbx2;
-  display.setCursor(pressureCursorX, baselinePressure);
-  display.print(pressureStr);
+  const time_t windowStart = nowTs - TIDE_CHART_PAST_S;
+  const time_t windowEnd = nowTs + TIDE_CHART_FUTURE_S;
+  const float secondsPerPixel = static_cast<float>(windowEnd - windowStart) / (right - left);
+
+  // Échelle verticale sur les étales visibles (et leurs voisines).
+  float minH = NAN;
+  float maxH = NAN;
+  for (int i = 0; i < gTideEventCount; ++i) {
+    const TideEvent& e = gTideEvents[i];
+    if (isnan(e.height) || e.ts < windowStart - 7 * 3600 || e.ts > windowEnd + 7 * 3600) {
+      continue;
+    }
+    minH = isnan(minH) ? e.height : min(minH, e.height);
+    maxH = isnan(maxH) ? e.height : max(maxH, e.height);
+  }
+  if (isnan(minH) || maxH - minH < 0.1f) {
+    minH = 0.0f;
+    maxH = 10.0f;
+  }
+  auto heightToY = [&](float h) {
+    return curveBottom - static_cast<int>(roundf((h - minH) / (maxH - minH) * (curveBottom - curveTop)));
+  };
+  auto timeToX = [&](time_t t) {
+    return left + static_cast<int>(roundf(static_cast<float>(t - windowStart) / secondsPerPixel));
+  };
+
+  // Eau : trame à 25 % sous la courbe, puis la courbe en trait épais.
+  int prevY = -1;
+  for (int x = left; x <= right; ++x) {
+    float h;
+    if (!tideHeightAt(windowStart + static_cast<time_t>((x - left) * secondsPerPixel), h)) {
+      prevY = -1;
+      continue;
+    }
+    const int y = heightToY(h);
+    for (int yy = y + 3; yy <= fillBottom; ++yy) {
+      if ((x % 2 == 0) && (yy % 2 == 0)) {
+        display.drawPixel(x, yy, GxEPD_BLACK);
+      }
+    }
+    if (prevY >= 0) {
+      display.drawLine(x - 1, prevY, x, y, GxEPD_BLACK);
+      display.drawLine(x - 1, prevY + 1, x, y + 1, GxEPD_BLACK);
+    }
+    prevY = y;
+  }
+  display.drawFastHLine(left, fillBottom + 1, right - left + 1, GxEPD_BLACK);
+
+  // Étiquettes des pleines mers au-dessus, des basses mers en dessous.
+  for (int i = 0; i < gTideEventCount; ++i) {
+    const TideEvent& e = gTideEvents[i];
+    if (e.ts < windowStart || e.ts > windowEnd || isnan(e.height)) {
+      continue;
+    }
+    const bool high = strcmp(e.type, "HIGH") == 0;
+    const int x = timeToX(e.ts);
+    const int y = heightToY(e.height);
+    struct tm eventTm;
+    char label[20];
+    if (localtime_r(&e.ts, &eventTm) == nullptr) {
+      continue;
+    }
+    snprintf(label, sizeof(label), "%02d:%02d %.1fm", eventTm.tm_hour, eventTm.tm_min, e.height);
+    display.setFont(&FreeSansBold9pt7b);
+    printLabel(label, x, high ? y - 8 : y + 22, ALIGN_CENTER, left, right);
+  }
+
+  // Repère "maintenant" : trait pointillé et point sur la courbe.
+  const int nowX = timeToX(nowTs);
+  for (int y = curveTop - 6; y <= fillBottom; y += 3) {
+    display.drawFastVLine(nowX, y, 2, GxEPD_BLACK);
+  }
+  float nowH;
+  if (tideHeightAt(nowTs, nowH)) {
+    const int nowY = heightToY(nowH);
+    display.fillCircle(nowX, nowY, 6, GxEPD_WHITE);
+    display.fillCircle(nowX, nowY, 4, GxEPD_BLACK);
+  }
 }
 
-void drawInteriorPanel(const Rect& area) {
-  const int originX = area.x;
-  const int originY = area.y;
-  const int w = area.w;
-  const int h = area.h;
-
-  const int centerY = originY + h / 2;
-  const int textPadding = 14;
-  const int textSpacing = 6;
-
-  int leftAnchor = leftColumnAnchor();
-  if (leftAnchor < originX + 2) {
-    leftAnchor = originX + 2;
-  }
-  int rightAnchor = rightColumnAnchor();
-  if (rightAnchor > originX + w - 2) {
-    rightAnchor = originX + w - 2;
-  }
-  const int leftColumnRightBound = originX + w / 2 - 6;
-  const int rightColumnLeftBound = originX + w / 2 + 6;
-
-  // Rez-de-chaussée
-  String tempRdcStr = isnan(tempRDC) ? String("--.-") : String(tempRDC, 1);
-  String humRdcStr = (humidityRDC >= 0) ? (String(humidityRDC) + " %") : String("-- %");
-
-  display.setFont(&FreeSansBold24pt7b);
-  int16_t rdcTbx1, rdcTby1; uint16_t rdcTbw1, rdcTbh1;
-  display.getTextBounds(tempRdcStr, 0, 0, &rdcTbx1, &rdcTby1, &rdcTbw1, &rdcTbh1);
+// Une colonne de mesure : titre, grande température, ligne secondaire.
+void drawMeasureColumn(const char* title, int centerX, float temperature, const char* detail) {
+  display.setFont(&FreeSansBold9pt7b);
+  printAligned(title, centerX, BOTTOM_AREA.y + 21, ALIGN_CENTER);
+  drawTemperature(temperature, centerX, BOTTOM_AREA.y + 61, ALIGN_CENTER, &FreeSansBold24pt7b, 4);
   display.setFont(&FreeSans12pt7b);
-  int16_t rdcTbx2, rdcTby2; uint16_t rdcTbw2, rdcTbh2;
-  display.getTextBounds(humRdcStr, 0, 0, &rdcTbx2, &rdcTby2, &rdcTbw2, &rdcTbh2);
+  printAligned(detail, centerX, BOTTOM_AREA.y + 86, ALIGN_CENTER);
+}
 
-  int textBlockHeightLeft = rdcTbh1 + textSpacing + rdcTbh2;
-  int textTopLeft = centerY - textBlockHeightLeft / 2;
-  const CelsiusIconAsset& salonIcon = CELSIUS_ICON_MEDIUM;
-  int tempRdcVisualWidth = rdcTbw1 + salonIcon.size + CELSIUS_ICON_PADDING;
-  int textWidthLeft = max(tempRdcVisualWidth, static_cast<int>(rdcTbw2));
+void drawBottomContent() {
+  display.setTextColor(GxEPD_BLACK);
+  const int width = display.width();
+  const int columnWidth = (width - 2 * SCREEN_MARGIN) / 3;
+  const int col1 = SCREEN_MARGIN + columnWidth / 2;
+  const int col2 = col1 + columnWidth;
+  const int col3 = col2 + columnWidth;
 
-  display.setFont(&FreeSansBold24pt7b);
-  int baselineTempLeft = textTopLeft - rdcTby1;
-  display.setCursor(leftAnchor - rdcTbx1, baselineTempLeft);
-  display.print(tempRdcStr);
-  int tempRdcTop = baselineTempLeft + rdcTby1;
-  int tempRdcIconX = leftAnchor + rdcTbw1 + CELSIUS_ICON_PADDING;
-  if (tempRdcIconX + salonIcon.size > leftColumnRightBound) {
-    tempRdcIconX = leftColumnRightBound - salonIcon.size;
+  char pressureStr[16];
+  if (pressureAtmospheric >= 0) {
+    snprintf(pressureStr, sizeof(pressureStr), "%d hPa", pressureAtmospheric);
+  } else {
+    strcpy(pressureStr, "-- hPa");
   }
-  if (tempRdcIconX < leftAnchor) {
-    tempRdcIconX = leftAnchor;
+  char humRdcStr[16];
+  char humEtageStr[16];
+  if (humidityRDC >= 0) {
+    snprintf(humRdcStr, sizeof(humRdcStr), "%d %%", humidityRDC);
+  } else {
+    strcpy(humRdcStr, "-- %");
   }
-  drawCelsiusIcon(tempRdcIconX, tempRdcTop, salonIcon);
-
-  display.setFont(&FreeSans12pt7b);
-  int baselineHumLeft = textTopLeft + rdcTbh1 + textSpacing - rdcTby2;
-  display.setCursor(leftAnchor - rdcTbx2, baselineHumLeft);
-  display.print(humRdcStr);
-
-  int leftIconCenterX = leftAnchor + textWidthLeft + textPadding + (ROOM_ICON_SIZE / 2);
-  if (leftIconCenterX + ROOM_ICON_SIZE / 2 > leftColumnRightBound) {
-    leftIconCenterX = leftColumnRightBound - ROOM_ICON_SIZE / 2;
+  if (humidityEtage >= 0) {
+    snprintf(humEtageStr, sizeof(humEtageStr), "%d %%", humidityEtage);
+  } else {
+    strcpy(humEtageStr, "-- %");
   }
-  drawGroundFloorIconCentered(leftIconCenterX, centerY);
 
-  // Étage
-  String tempEtageStr = isnan(tempEtage) ? String("--.-") : String(tempEtage, 1);
-  String humEtageStr = (humidityEtage >= 0) ? (String(humidityEtage) + " %") : String("-- %");
+  drawMeasureColumn("EXTERIEUR", col1, tempExterior, pressureStr);
+  drawMeasureColumn("RDC", col2, tempRDC, humRdcStr);
+  drawMeasureColumn("ETAGE", col3, tempEtage, humEtageStr);
 
-  display.setFont(&FreeSansBold24pt7b);
-  int16_t etgTbx1, etgTby1; uint16_t etgTbw1, etgTbh1;
-  display.getTextBounds(tempEtageStr, 0, 0, &etgTbx1, &etgTby1, &etgTbw1, &etgTbh1);
-  display.setFont(&FreeSans12pt7b);
-  int16_t etgTbx2, etgTby2; uint16_t etgTbw2, etgTbh2;
-  display.getTextBounds(humEtageStr, 0, 0, &etgTbx2, &etgTby2, &etgTbw2, &etgTbh2);
-
-  int textBlockHeightRight = etgTbh1 + textSpacing + etgTbh2;
-  int textTopRight = centerY - textBlockHeightRight / 2;
-  const CelsiusIconAsset& etageIcon = CELSIUS_ICON_MEDIUM;
-  int tempEtgVisualWidth = etgTbw1 + etageIcon.size + CELSIUS_ICON_PADDING;
-  int textWidthRight = max(tempEtgVisualWidth, static_cast<int>(etgTbw2));
-
-  display.setFont(&FreeSansBold24pt7b);
-  int baselineTempRight = textTopRight - etgTby1;
-  int textRightEdge = rightAnchor - etageIcon.size - CELSIUS_ICON_PADDING;
-  int cursorTempRight = textRightEdge - etgTbw1 - etgTbx1;
-  display.setCursor(cursorTempRight, baselineTempRight);
-  display.print(tempEtageStr);
-  int tempEtgTop = baselineTempRight + etgTby1;
-  int tempEtgIconX = rightAnchor - etageIcon.size;
-  if (tempEtgIconX < rightColumnLeftBound) {
-    tempEtgIconX = rightColumnLeftBound;
+  // Vent, sous la colonne extérieure : flèche, vitesse et direction.
+  display.setFont(&FreeSans9pt7b);
+  const int windBaseline = BOTTOM_AREA.y + BOTTOM_AREA.h - 6;
+  if (isnan(windSpeedKmh) || isnan(windBearingDegrees)) {
+    printAligned("Vent --", col1, windBaseline, ALIGN_CENTER);
+  } else {
+    char windStr[20];
+    snprintf(windStr, sizeof(windStr), "%.0f km/h %s", windSpeedKmh, compassPoint(windBearingDegrees));
+    int16_t bx, by;
+    uint16_t bw, bh;
+    display.getTextBounds(windStr, 0, 0, &bx, &by, &bw, &bh);
+    const int arrowSize = 22;
+    const int blockLeft = col1 - (arrowSize + 4 + static_cast<int>(bw)) / 2;
+    drawWindArrow(blockLeft + arrowSize / 2, windBaseline - 5, windBearingDegrees, arrowSize);
+    printAligned(windStr, blockLeft + arrowSize + 4, windBaseline, ALIGN_LEFT);
   }
-  drawCelsiusIcon(tempEtgIconX, tempEtgTop, etageIcon);
 
-  display.setFont(&FreeSans12pt7b);
-  int baselineHumRight = textTopRight + etgTbh1 + textSpacing - etgTby2;
-  int cursorHumRight = rightAnchor - etgTbw2 - etgTbx2;
-  display.setCursor(cursorHumRight, baselineHumRight);
-  display.print(humEtageStr);
+  display.fillRect(SCREEN_MARGIN, BOTTOM_AREA.y, width - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
+  // Les séparateurs s'arrêtent au-dessus de la ligne du vent, plus large que sa colonne.
+  const int separatorTop = BOTTOM_AREA.y + 10;
+  const int separatorHeight = 82;
+  display.drawFastVLine(SCREEN_MARGIN + columnWidth, separatorTop, separatorHeight, GxEPD_BLACK);
+  display.drawFastVLine(SCREEN_MARGIN + 2 * columnWidth, separatorTop, separatorHeight, GxEPD_BLACK);
+}
 
-  int rightIconCenterX = rightAnchor - textWidthRight - textPadding - (ROOM_ICON_SIZE / 2);
-  if (rightIconCenterX - ROOM_ICON_SIZE / 2 < rightColumnLeftBound) {
-    rightIconCenterX = rightColumnLeftBound + ROOM_ICON_SIZE / 2;
-  }
-  drawUpperFloorIconCentered(rightIconCenterX, centerY);
+void refreshArea(const Rect& area, void (*draw)()) {
+  display.setPartialWindow(area.x, area.y, area.w, area.h);
+  display.firstPage();
+  do {
+    clearArea(area);
+    draw();
+  } while (display.nextPage());
 }
 
 void updateHeaderSection() {
-  const Rect& area = gLayout.header;
-  display.setPartialWindow(area.x, area.y, area.w, area.h);
-  display.firstPage();
-  do {
-    clearArea(area);
-    drawHeaderContent();
-  } while (display.nextPage());
+  refreshArea(HEADER_AREA, drawHeaderContent);
 }
 
 void updateTideSection() {
-  const Rect& area = gLayout.tide;
-  display.setPartialWindow(area.x, area.y, area.w, area.h);
-  display.firstPage();
-  do {
-    clearArea(area);
-    drawTidePanel(area);
-  } while (display.nextPage());
-  updateCentralSeparator();
+  refreshArea(TIDE_AREA, drawTideContent);
 }
 
-void updateExteriorSection() {
-  const Rect& area = gLayout.exterior;
-  display.setPartialWindow(area.x, area.y, area.w, area.h);
-  display.firstPage();
-  do {
-    clearArea(area);
-    drawExteriorPanel(area);
-  } while (display.nextPage());
-}
-
-void updateCentralSeparator() {
-  const Rect& rect = gLayout.centralSeparator;
-  if (rect.w <= 0 || rect.h <= 0) {
-    return;
-  }
-  display.setPartialWindow(rect.x, rect.y, rect.w, rect.h);
-  display.firstPage();
-  do {
-    clearArea(rect);
-    drawVerticalSeparator(rect);
-  } while (display.nextPage());
-}
-
-void updateMiddleSeparator() {
-  const Rect& rect = gLayout.middleSeparator;
-  display.setPartialWindow(rect.x, rect.y, rect.w, rect.h);
-  display.firstPage();
-  do {
-    clearArea(rect);
-    drawThickSeparator(rect);
-  } while (display.nextPage());
-}
-
-void updateInteriorSection() {
-  const Rect& area = gLayout.interior;
-  display.setPartialWindow(area.x, area.y, area.w, area.h);
-  display.firstPage();
-  do {
-    clearArea(area);
-    drawInteriorPanel(area);
-  } while (display.nextPage());
-  updateInteriorSeparator();
-}
-
-void updateInteriorSeparator() {
-  const Rect& rect = gLayout.interiorSeparator;
-  display.setPartialWindow(rect.x, rect.y, rect.w, rect.h);
-  display.firstPage();
-  do {
-    clearArea(rect);
-    drawVerticalSeparator(rect);
-  } while (display.nextPage());
+void updateBottomSection() {
+  refreshArea(BOTTOM_AREA, drawBottomContent);
 }
 
 // Rafraîchissement complet en une seule passe : efface la rémanence laissée
@@ -1105,12 +921,8 @@ void displayWeatherStation() {
   do {
     display.fillScreen(GxEPD_WHITE);
     drawHeaderContent();
-    drawInteriorPanel(gLayout.interior);
-    drawVerticalSeparator(gLayout.interiorSeparator);
-    drawThickSeparator(gLayout.middleSeparator);
-    drawTidePanel(gLayout.tide);
-    drawVerticalSeparator(gLayout.centralSeparator);
-    drawExteriorPanel(gLayout.exterior);
+    drawTideContent();
+    drawBottomContent();
   } while (display.nextPage());
   display.powerOff();
 
@@ -1124,20 +936,16 @@ void displayWeatherStation() {
 // consomme les drapeaux gXxxNeedsUpdate.
 void refreshDirtySections() {
   bool refreshed = false;
-  if (gExteriorNeedsUpdate) {
-    gExteriorNeedsUpdate = false;
-    updateExteriorSection();
-    refreshed = true;
-  }
   if (gTideNeedsUpdate) {
     gTideNeedsUpdate = false;
     updateTideSection();
     refreshed = true;
   }
-  if (gGroundNeedsUpdate || gUpperNeedsUpdate) {
+  if (gExteriorNeedsUpdate || gGroundNeedsUpdate || gUpperNeedsUpdate) {
+    gExteriorNeedsUpdate = false;
     gGroundNeedsUpdate = false;
     gUpperNeedsUpdate = false;
-    updateInteriorSection();
+    updateBottomSection();
     refreshed = true;
   }
   if (refreshed) {
@@ -1178,6 +986,10 @@ void onMinuteTick() {
   updateForecastFromStoredData();
   expireStaleMeasurements();
 
+  if (gTimeValid && gNow.tm_min % TIDE_CHART_REFRESH_MINUTES == 0) {
+    gTideNeedsUpdate = true;  // fait glisser la courbe et le repère "maintenant"
+  }
+
   if (++minutesSinceFullRefresh >= FULL_REFRESH_EVERY_MINUTES) {
     minutesSinceFullRefresh = 0;
     displayWeatherStation();
@@ -1198,7 +1010,6 @@ void setup() {
 
   display.init(DISPLAY_DIAG_BAUD);
   display.setRotation(0); // Mode paysage (400x300)
-  computeLayout();
 
   // Laisser au réseau le temps de fournir l'heure et les messages MQTT
   // retenus, pour que le premier affichage soit complet. Sans réseau, on
