@@ -190,6 +190,8 @@ constexpr int STATION_TOPIC_COUNT = sizeof(STATION_TOPICS) / sizeof(STATION_TOPI
 // à la place des mesures.
 enum class ConfigReason : uint8_t { NONE, NO_WIFI_SETTINGS, WIFI_UNREACHABLE, REQUESTED };
 ConfigReason gConfigReason = ConfigReason::NONE;
+// Mise à jour du firmware en cours : l'écran et MQTT restent en pause.
+bool gFirmwareUpdating = false;
 uint8_t gReceivedTopicsMask = 0;
 
 // Étapes affichées par l'écran de démarrage.
@@ -1319,6 +1321,40 @@ void enterConfigMode(ConfigReason reason) {
   showFullScreen(drawConfigScreenContent);
 }
 
+void drawFirmwareUpdateContent() {
+  display.setTextColor(GxEPD_BLACK);
+  const int centerX = display.width() / 2;
+  useFont(FONT_LARGE);
+  printAligned("Mise à jour", centerX, 120, ALIGN_CENTER);
+  useFont(FONT_MEDIUM);
+  printAligned("Installation du nouveau firmware", centerX, 160, ALIGN_CENTER);
+  useFont(FONT_SMALL_BOLD);
+  printAligned("Ne pas débrancher la station", centerX, 200, ALIGN_CENTER);
+  useFont(FONT_SMALL);
+  printAligned("Elle redémarrera d'elle-même dans une minute environ.", centerX, 226, ALIGN_CENTER);
+}
+
+// Appelée par le portail web au début d'une mise à jour (page web ou
+// PlatformIO) : message à l'écran, puis plus rien ne touche à l'écran ni à
+// MQTT jusqu'au redémarrage.
+void onFirmwareUpdateStart() {
+  gFirmwareUpdating = true;
+  STATION_LOG_PRINTLN("Mise à jour du firmware");
+  gMqttClient.disconnect();
+  showFullScreen(drawFirmwareUpdateContent);
+}
+
+// Échec de la mise à jour : le firmware actuel continue, on rétablit l'écran.
+void onFirmwareUpdateFailed() {
+  gFirmwareUpdating = false;
+  STATION_LOG_PRINTLN("Échec de la mise à jour du firmware");
+  if (gConfigReason != ConfigReason::NONE) {
+    showFullScreen(drawConfigScreenContent);
+  } else {
+    displayWeatherStation();
+  }
+}
+
 // Le WiFi de la maison est revenu pendant le mode configuration ouvert faute
 // de réseau : refermer le point d'accès et reprendre l'affichage normal.
 void leaveConfigMode() {
@@ -1608,6 +1644,10 @@ void setup() {
 void loop() {
   serviceDoubleResetWindow();
   webPortalLoop();
+  if (gFirmwareUpdating) {
+    delay(5);
+    return;
+  }
   serviceNetwork();
 
   if (gConfigReason != ConfigReason::NONE) {

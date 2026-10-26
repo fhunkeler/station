@@ -12,6 +12,7 @@ class PubSubClient {
   bool connect(const char*) { return false; }
   bool connect(const char*, const char*, const char*) { return false; }
   bool subscribe(const char*) { return true; }
+  void disconnect() {}
   void setSocketTimeout(uint16_t) {}
   void setKeepAlive(uint16_t) {}
   int state() { return -1; }

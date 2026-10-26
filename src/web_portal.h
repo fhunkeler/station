@@ -21,6 +21,11 @@ int webPortalAccessPointClients();
 // Échappe un texte pour l'insérer dans une page HTML.
 String webPortalEscape(const char* text);
 
+// Fournies par main.cpp : début d'une mise à jour du firmware (message à
+// l'écran, MQTT suspendu) et échec (retour à l'affichage normal).
+void onFirmwareUpdateStart();
+void onFirmwareUpdateFailed();
+
 // Fournie par main.cpp : lignes de tableau HTML (<tr>...</tr>) décrivant
 // l'état courant de la station, pour la page d'accueil.
 void appendStationStatus(String& html);

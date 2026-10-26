@@ -1,7 +1,9 @@
 #include "web_portal.h"
 
+#include <ArduinoOTA.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
+#include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
 
@@ -15,6 +17,8 @@ bool gAccessPointActive = false;
 bool gMdnsStarted = false;
 unsigned long gRestartAtMs = 0;
 bool gRestartPending = false;
+bool gUploadRejected = false;  // envoi de firmware refusé (accès ou fichier)
+bool gArduinoOtaStarted = false;
 
 constexpr uint8_t DNS_PORT = 53;
 
@@ -28,6 +32,9 @@ void logRequest(const char* what) {
 void logRequest(const char*) {}
 #endif
 constexpr unsigned long RESTART_DELAY_MS = 1500;
+constexpr uint16_t ARDUINO_OTA_PORT = 3232;
+
+bool firmwareUpdateAllowed();
 
 // ---------- Utilitaires HTML ----------
 
@@ -213,7 +220,23 @@ void sendPage(const String& message, bool isError, int code = 200) {
 
   html += "<div class=\"actions\"><button type=\"submit\">Enregistrer et redémarrer</button></div></form>";
 
-  html += "<section style=\"margin-top:14px\"><h2>Maintenance</h2><div class=\"actions\">"
+  html += "<section style=\"margin-top:14px\"><h2>Mise à jour du firmware</h2>";
+  if (firmwareUpdateAllowed()) {
+    html += "<form method=\"post\" action=\"/update\" enctype=\"multipart/form-data\" "
+            "onsubmit=\"this.querySelector('button').disabled=true;"
+            "this.querySelector('button').textContent='Envoi en cours...'\">"
+            "<input type=\"file\" name=\"firmware\" accept=\".bin\" required>"
+            "<div class=\"actions\" style=\"margin-top:10px\"><button>Installer</button></div></form>"
+            "<p class=\"note\">Fichier <code>.pio/build/lolin_d32/firmware.bin</code> produit par "
+            "<code>pio run</code>. Ne pas couper l'alimentation pendant l'installation (une minute environ). "
+            "Depuis PlatformIO : <code>pio run -e lolin_d32_ota -t upload</code>.</p>";
+  } else {
+    html += "<p class=\"note\">Définissez d'abord un mot de passe d'administration : il protège "
+            "l'installation d'un nouveau firmware depuis le réseau.</p>";
+  }
+  html += "</section>";
+
+  html += "<section><h2>Maintenance</h2><div class=\"actions\">"
           "<form method=\"post\" action=\"/restart\"><button class=\"secondary\">Redémarrer</button></form>"
           "<form method=\"post\" action=\"/reset\" onsubmit=\"return confirm('Revenir aux réglages "
           "d\\'usine ? La station redémarrera.')\"><button class=\"danger\">Réglages d'usine</button></form>"
@@ -247,6 +270,19 @@ bool requestFromAccessPoint() {
 // Le point d'accès suppose un accès physique (son mot de passe s'affiche sur
 // l'écran) : pas de mot de passe d'administration demandé par ce chemin.
 // C'est aussi la voie de secours si le mot de passe est oublié.
+// Même règle qu'authorize(), sans répondre au navigateur : utilisable
+// pendant la réception d'un fichier.
+bool isAuthorized() {
+  return gConfig.adminPassword[0] == '\0' || requestFromAccessPoint() ||
+         gServer.authenticate("admin", gConfig.adminPassword);
+}
+
+// Installer un firmware depuis le réseau exige un mot de passe
+// d'administration ; le point d'accès (accès physique) suffit aussi.
+bool firmwareUpdateAllowed() {
+  return gConfig.adminPassword[0] != '\0' || requestFromAccessPoint();
+}
+
 bool authorize() {
   if (gConfig.adminPassword[0] == '\0' || requestFromAccessPoint()) {
     return true;
@@ -382,6 +418,85 @@ void handleSave() {
   sendRestartPage("Réglages enregistrés. La station redémarre.");
 }
 
+// ---------- Mise à jour du firmware ----------
+
+// Réception du fichier, morceau par morceau.
+void handleFirmwareUpload() {
+  HTTPUpload& upload = gServer.upload();
+  switch (upload.status) {
+    case UPLOAD_FILE_START:
+      gUploadRejected = !firmwareUpdateAllowed() || !isAuthorized();
+      if (gUploadRejected) {
+        return;
+      }
+      logRequest("mise à jour");
+      onFirmwareUpdateStart();
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+        gUploadRejected = true;
+      }
+      break;
+    case UPLOAD_FILE_WRITE:
+      // Update vérifie l'en-tête du premier bloc : un fichier qui n'est pas
+      // un firmware ESP32 est refusé avant toute écriture utile.
+      if (!gUploadRejected && Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        gUploadRejected = true;
+      }
+      break;
+    case UPLOAD_FILE_END:
+      if (!gUploadRejected && !Update.end(true)) {
+        gUploadRejected = true;
+      }
+      break;
+    case UPLOAD_FILE_ABORTED:
+      Update.abort();
+      gUploadRejected = true;
+      break;
+  }
+}
+
+// Réponse une fois le fichier entièrement reçu.
+void handleFirmwareUploaded() {
+  if (!firmwareUpdateAllowed()) {
+    sendPage("Mise à jour refusée : définissez d'abord un mot de passe d'administration.", true, 403);
+    return;
+  }
+  if (!authorize()) {
+    return;
+  }
+  if (gUploadRejected || Update.hasError() || !Update.isFinished()) {
+    String message = "La mise à jour a échoué";
+    if (Update.hasError()) {
+      message += " : ";
+      message += htmlEscape(Update.errorString());
+    }
+    message += ". Le firmware actuel est conservé.";
+    Update.abort();
+    onFirmwareUpdateFailed();
+    sendPage(message, true, 400);
+    return;
+  }
+  sendRestartPage("Nouveau firmware installé. La station redémarre.");
+}
+
+// Mise à jour depuis PlatformIO (protocole espota), avec le même mot de
+// passe que la page. Lancée seulement si ce mot de passe existe.
+void startArduinoOta() {
+  if (gArduinoOtaStarted || gConfig.adminPassword[0] == '\0' || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  ArduinoOTA.setPort(ARDUINO_OTA_PORT);
+  ArduinoOTA.setHostname(gConfig.hostname);
+  ArduinoOTA.setPassword(gConfig.adminPassword);
+  ArduinoOTA.setMdnsEnabled(false);  // mDNS déjà géré ici
+  ArduinoOTA.onStart([]() { onFirmwareUpdateStart(); });
+  ArduinoOTA.onError([](ota_error_t) { onFirmwareUpdateFailed(); });
+  ArduinoOTA.begin();
+  if (gMdnsStarted) {
+    MDNS.enableArduino(ARDUINO_OTA_PORT, true);
+  }
+  gArduinoOtaStarted = true;
+}
+
 // ---------- Portail captif ----------
 
 void handleNotFound() {
@@ -432,6 +547,7 @@ void webPortalBegin() {
       sendRestartPage("Réglages d'usine rétablis. La station redémarre.");
     }
   });
+  gServer.on("/update", HTTP_POST, handleFirmwareUploaded, handleFirmwareUpload);
   gServer.onNotFound(handleNotFound);
   gServer.begin();
 }
@@ -446,7 +562,15 @@ void webPortalLoop() {
     gMdnsStarted = MDNS.begin(gConfig.hostname);
     if (gMdnsStarted) {
       MDNS.addService("http", "tcp", 80);
+      if (gArduinoOtaStarted) {
+        MDNS.enableArduino(ARDUINO_OTA_PORT, true);
+      }
     }
+  }
+
+  startArduinoOta();
+  if (gArduinoOtaStarted) {
+    ArduinoOTA.handle();  // redémarre seul à la fin d'une mise à jour réussie
   }
 
   if (gRestartPending && millis() - gRestartAtMs >= RESTART_DELAY_MS) {
