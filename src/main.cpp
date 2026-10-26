@@ -166,19 +166,18 @@ struct Rect {
   int16_t h;
 };
 
-// Trois bandes pleine largeur, chacune rafraîchie par une fenêtre partielle.
+// Quatre bandes pleine largeur, chacune rafraîchie par une fenêtre partielle.
 // Les ordonnées restent indépendantes de l'alignement sur 8 px, qui ne
 // concerne que x et w (toujours 0 et 400 ici).
 constexpr int16_t SCREEN_MARGIN = 12;
 constexpr Rect HEADER_AREA = {0, 0, 400, 64};
-constexpr Rect TIDE_AREA = {0, 64, 400, 120};
-constexpr Rect BOTTOM_AREA = {0, 184, 400, 116};
+constexpr Rect TIDE_AREA = {0, 64, 400, 68};
+constexpr Rect WIND_AREA = {0, 132, 400, 72};
+constexpr Rect BOTTOM_AREA = {0, 204, 400, 96};
 
-// Fenêtre de la courbe de marée autour de l'heure courante.
-constexpr time_t TIDE_CHART_PAST_S = 6 * 3600;
-constexpr time_t TIDE_CHART_FUTURE_S = 18 * 3600;
-// Le repère "maintenant" glisse d'environ 1,6 px toutes les 10 minutes.
+// Le repère "maintenant" sur l'arc de marée avance toutes les 10 minutes.
 constexpr int TIDE_CHART_REFRESH_MINUTES = 10;
+
 WiFiClient gMqttWiFiClient;
 PubSubClient gMqttClient(gMqttWiFiClient);
 bool gExteriorNeedsUpdate = false;
@@ -196,6 +195,7 @@ void clearArea(const Rect& area) {
 
 void updateHeaderSection();
 void updateTideSection();
+void updateWindSection();
 void updateBottomSection();
 bool updateTideForecastFromStoredEvents();
 void serviceNetwork();
@@ -725,43 +725,58 @@ void drawHeaderContent() {
   display.fillRect(SCREEN_MARGIN, HEADER_AREA.y + HEADER_AREA.h - 3, display.width() - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
 }
 
-// Hauteur d'eau estimée à l'instant t par la règle du cosinus entre les deux
-// étales qui l'encadrent. Faux si t sort des données connues.
-bool tideHeightAt(time_t t, float& outHeight) {
-  for (int i = 0; i + 1 < gTideEventCount; ++i) {
-    const TideEvent& a = gTideEvents[i];
-    const TideEvent& b = gTideEvents[i + 1];
-    if (t < a.ts || t > b.ts || b.ts <= a.ts || isnan(a.height) || isnan(b.height)) {
-      continue;
+// Indice de l'étale à l'instant ts dans gTideEvents, -1 si absente.
+int findTideEventIndex(time_t ts) {
+  for (int i = 0; i < gTideEventCount; ++i) {
+    if (gTideEvents[i].ts == ts) {
+      return i;
     }
-    const float progress = static_cast<float>(t - a.ts) / static_cast<float>(b.ts - a.ts);
-    outHeight = a.height + (b.height - a.height) * (1.0f - cosf(PI * progress)) / 2.0f;
-    return true;
   }
-  return false;
+  return -1;
 }
 
+// Heure et hauteur d'une étale sur deux lignes, alignées sur x.
+void drawTideExtremum(const TideEvent& event, int x, TextAlign align) {
+  struct tm eventTm;
+  char timeStr[6] = "--:--";
+  if (localtime_r(&event.ts, &eventTm) != nullptr) {
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d", eventTm.tm_hour, eventTm.tm_min);
+  }
+  char detail[20];
+  const char* kind = strcmp(event.type, "HIGH") == 0 ? "PM" : "BM";
+  if (isnan(event.height)) {
+    snprintf(detail, sizeof(detail), "%s", kind);
+  } else {
+    snprintf(detail, sizeof(detail), "%s %.1f m", kind, event.height);
+  }
+  display.setFont(&FreeSansBold12pt7b);
+  printAligned(timeStr, x, TIDE_AREA.y + 42, align);
+  display.setFont(&FreeSans9pt7b);
+  printAligned(detail, x, TIDE_AREA.y + 61, align);
+}
+
+// Marée réduite à la demi-oscillation en cours : étale précédente à gauche,
+// suivante à droite, et entre les deux l'arc correspondant avec la position
+// actuelle.
 void drawTideContent() {
   const int left = SCREEN_MARGIN;
   const int right = display.width() - SCREEN_MARGIN;
-  const int titleBaseline = TIDE_AREA.y + 17;
-  const int curveTop = TIDE_AREA.y + 48;     // ordonnée de la plus haute mer
-  const int curveBottom = TIDE_AREA.y + 90;  // ordonnée de la plus basse mer
-  const int fillBottom = curveBottom + 4;
+  const int titleBaseline = TIDE_AREA.y + 16;
 
   display.setTextColor(GxEPD_BLACK);
   time_t nowTs = 0;
-  if (!currentEpoch(nowTs) || nextTideEpoch == 0) {
+  const int nextIdx = findTideEventIndex(nextTideEpoch);
+  const int prevIdx = findTideEventIndex(prevTideEpoch);
+  if (!currentEpoch(nowTs) || nextTideEpoch == 0 || nextIdx < 0) {
     display.setFont(&FreeSansBold9pt7b);
     printAligned("MAREE", left, titleBaseline, ALIGN_LEFT);
     display.setFont(&FreeSans9pt7b);
-    printAligned("Donnees indisponibles", display.width() / 2, TIDE_AREA.y + 70, ALIGN_CENTER);
+    printAligned("Donnees indisponibles", display.width() / 2, TIDE_AREA.y + 46, ALIGN_CENTER);
     return;
   }
 
   display.setFont(&FreeSansBold9pt7b);
   printAligned(isTideRising ? "MAREE MONTANTE" : "MAREE DESCENDANTE", left, titleBaseline, ALIGN_LEFT);
-
   char coefStr[16];
   if (tideCoefficient >= 0) {
     snprintf(coefStr, sizeof(coefStr), "Coef %d", tideCoefficient);
@@ -770,42 +785,29 @@ void drawTideContent() {
   }
   printAligned(coefStr, right, titleBaseline, ALIGN_RIGHT);
 
-  const time_t windowStart = nowTs - TIDE_CHART_PAST_S;
-  const time_t windowEnd = nowTs + TIDE_CHART_FUTURE_S;
-  const float secondsPerPixel = static_cast<float>(windowEnd - windowStart) / (right - left);
-
-  // Échelle verticale sur les étales visibles (et leurs voisines).
-  float minH = NAN;
-  float maxH = NAN;
-  for (int i = 0; i < gTideEventCount; ++i) {
-    const TideEvent& e = gTideEvents[i];
-    if (isnan(e.height) || e.ts < windowStart - 7 * 3600 || e.ts > windowEnd + 7 * 3600) {
-      continue;
-    }
-    minH = isnan(minH) ? e.height : min(minH, e.height);
-    maxH = isnan(maxH) ? e.height : max(maxH, e.height);
+  const TideEvent& next = gTideEvents[nextIdx];
+  drawTideExtremum(next, right, ALIGN_RIGHT);
+  if (prevIdx < 0) {
+    return;
   }
-  if (isnan(minH) || maxH - minH < 0.1f) {
-    minH = 0.0f;
-    maxH = 10.0f;
-  }
-  auto heightToY = [&](float h) {
-    return curveBottom - static_cast<int>(roundf((h - minH) / (maxH - minH) * (curveBottom - curveTop)));
-  };
-  auto timeToX = [&](time_t t) {
-    return left + static_cast<int>(roundf(static_cast<float>(t - windowStart) / secondsPerPixel));
-  };
+  const TideEvent& prev = gTideEvents[prevIdx];
+  drawTideExtremum(prev, left, ALIGN_LEFT);
 
-  // Eau : trame à 25 % sous la courbe, puis la courbe en trait épais.
+  // Arc entre les deux étales (règle du cosinus), trame sous la courbe.
+  const int arcLeft = left + 86;
+  const int arcRight = right - 86;
+  const int arcTop = TIDE_AREA.y + 26;
+  const int arcBottom = TIDE_AREA.y + 60;
+  const bool rising = !isnan(prev.height) && !isnan(next.height) ? next.height > prev.height : isTideRising;
+  auto arcY = [&](float progress) {
+    const float level = (1.0f - cosf(PI * progress)) / 2.0f;  // 0 au départ, 1 à l'arrivée
+    const float fromLow = rising ? level : 1.0f - level;
+    return arcBottom - static_cast<int>(roundf(fromLow * (arcBottom - arcTop)));
+  };
   int prevY = -1;
-  for (int x = left; x <= right; ++x) {
-    float h;
-    if (!tideHeightAt(windowStart + static_cast<time_t>((x - left) * secondsPerPixel), h)) {
-      prevY = -1;
-      continue;
-    }
-    const int y = heightToY(h);
-    for (int yy = y + 3; yy <= fillBottom; ++yy) {
+  for (int x = arcLeft; x <= arcRight; ++x) {
+    const int y = arcY(static_cast<float>(x - arcLeft) / (arcRight - arcLeft));
+    for (int yy = y + 3; yy <= arcBottom + 2; ++yy) {
       if ((x % 2 == 0) && (yy % 2 == 0)) {
         display.drawPixel(x, yy, GxEPD_BLACK);
       }
@@ -816,47 +818,109 @@ void drawTideContent() {
     }
     prevY = y;
   }
-  display.drawFastHLine(left, fillBottom + 1, right - left + 1, GxEPD_BLACK);
+  display.drawFastHLine(arcLeft, arcBottom + 3, arcRight - arcLeft + 1, GxEPD_BLACK);
 
-  // Étiquettes des pleines mers au-dessus, des basses mers en dessous.
-  for (int i = 0; i < gTideEventCount; ++i) {
-    const TideEvent& e = gTideEvents[i];
-    if (e.ts < windowStart || e.ts > windowEnd || isnan(e.height)) {
-      continue;
-    }
-    const bool high = strcmp(e.type, "HIGH") == 0;
-    const int x = timeToX(e.ts);
-    const int y = heightToY(e.height);
-    struct tm eventTm;
-    char label[20];
-    if (localtime_r(&e.ts, &eventTm) == nullptr) {
-      continue;
-    }
-    snprintf(label, sizeof(label), "%02d:%02d %.1fm", eventTm.tm_hour, eventTm.tm_min, e.height);
-    display.setFont(&FreeSansBold9pt7b);
-    printLabel(label, x, high ? y - 8 : y + 22, ALIGN_CENTER, left, right);
-  }
-
-  // Repère "maintenant" : trait pointillé et point sur la courbe.
-  const int nowX = timeToX(nowTs);
-  for (int y = curveTop - 6; y <= fillBottom; y += 3) {
-    display.drawFastVLine(nowX, y, 2, GxEPD_BLACK);
-  }
-  float nowH;
-  if (tideHeightAt(nowTs, nowH)) {
-    const int nowY = heightToY(nowH);
+  if (next.ts > prev.ts) {
+    const float progress = constrain(static_cast<float>(nowTs - prev.ts) / static_cast<float>(next.ts - prev.ts), 0.0f, 1.0f);
+    const int nowX = arcLeft + static_cast<int>(roundf(progress * (arcRight - arcLeft)));
+    const int nowY = arcY(progress);
     display.fillCircle(nowX, nowY, 6, GxEPD_WHITE);
     display.fillCircle(nowX, nowY, 4, GxEPD_BLACK);
   }
 }
 
-// Une colonne de mesure : titre, grande température, ligne secondaire.
-void drawMeasureColumn(const char* title, int centerX, float temperature, const char* detail) {
+// Premier point de prévision à partir de l'instant t (tolérance 30 min).
+const ForecastPoint* forecastAt(time_t t) {
+  for (int i = 0; i < gForecastCount; ++i) {
+    if (gForecastPoints[i].ts >= t - 1800) {
+      return &gForecastPoints[i];
+    }
+  }
+  return nullptr;
+}
+
+// Bande vent : situation actuelle à gauche, prévision à +3/+6/+9/+12 h à droite.
+void drawWindContent() {
+  display.setTextColor(GxEPD_BLACK);
+  const int width = display.width();
+  const int y0 = WIND_AREA.y;
+  display.fillRect(SCREEN_MARGIN, y0, width - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
+
+  const int splitX = 200;
+  const int arrowSize = 46;
+  const int arrowCenterX = SCREEN_MARGIN + arrowSize / 2 + 2;
+  const int arrowCenterY = y0 + 38;
+  const int textX = SCREEN_MARGIN + arrowSize + 12;
+
+  if (isnan(windSpeedKmh) || isnan(windBearingDegrees)) {
+    display.setFont(&FreeSansBold9pt7b);
+    printAligned("VENT", SCREEN_MARGIN, y0 + 24, ALIGN_LEFT);
+    display.setFont(&FreeSans12pt7b);
+    printAligned("--", SCREEN_MARGIN, y0 + 52, ALIGN_LEFT);
+  } else {
+    drawWindArrow(arrowCenterX, arrowCenterY, windBearingDegrees, arrowSize);
+    char speedStr[8];
+    snprintf(speedStr, sizeof(speedStr), "%.0f", windSpeedKmh);
+    display.setFont(&FreeSansBold24pt7b);
+    const int speedRight = printAligned(speedStr, textX, y0 + 44, ALIGN_LEFT);
+    display.setFont(&FreeSans9pt7b);
+    printAligned("km/h", speedRight + 5, y0 + 44, ALIGN_LEFT);
+    display.setFont(&FreeSansBold9pt7b);
+    printAligned(compassPoint(windBearingDegrees), speedRight + 5, y0 + 24, ALIGN_LEFT);
+
+    char gustStr[24];
+    if (isnan(windGustKmh)) {
+      strcpy(gustStr, "Rafales --");
+    } else {
+      snprintf(gustStr, sizeof(gustStr), "Rafales %.0f", windGustKmh);
+    }
+    display.setFont(&FreeSans9pt7b);
+    printAligned(gustStr, textX, y0 + 65, ALIGN_LEFT);
+  }
+
+  display.drawFastVLine(splitX, y0 + 10, WIND_AREA.h - 18, GxEPD_BLACK);
+
+  // Tendance : flèche et vitesse moyenne toutes les 3 heures.
+  time_t nowTs = 0;
+  const bool timeKnown = currentEpoch(nowTs);
+  constexpr int SLOT_COUNT = 4;
+  const int slotsLeft = splitX + 4;
+  const int slotWidth = (width - SCREEN_MARGIN - slotsLeft) / SLOT_COUNT;
+  for (int slot = 0; slot < SLOT_COUNT; ++slot) {
+    const int cx = slotsLeft + slot * slotWidth + slotWidth / 2;
+    const ForecastPoint* point = timeKnown ? forecastAt(nowTs + (slot + 1) * 3 * 3600) : nullptr;
+    char hourStr[6] = "--";
+    char slotSpeed[8] = "--";
+    if (point != nullptr) {
+      struct tm pointTm;
+      if (localtime_r(&point->ts, &pointTm) != nullptr) {
+        snprintf(hourStr, sizeof(hourStr), "%dh", pointTm.tm_hour);
+      }
+      if (!isnan(point->speed)) {
+        snprintf(slotSpeed, sizeof(slotSpeed), "%.0f", point->speed);
+      }
+      if (!isnan(point->bearing)) {
+        drawWindArrow(cx, y0 + 39, point->bearing, 26);
+      }
+    }
+    display.setFont(&FreeSans9pt7b);
+    printAligned(hourStr, cx, y0 + 21, ALIGN_CENTER);
+    display.setFont(&FreeSansBold9pt7b);
+    printAligned(slotSpeed, cx, y0 + 66, ALIGN_CENTER);
+  }
+}
+
+// Une colonne de mesure : titre, grande température, une ou deux lignes de détail.
+void drawMeasureColumn(const char* title, int centerX, float temperature, const char* detail, const char* detail2) {
   display.setFont(&FreeSansBold9pt7b);
-  printAligned(title, centerX, BOTTOM_AREA.y + 21, ALIGN_CENTER);
-  drawTemperature(temperature, centerX, BOTTOM_AREA.y + 61, ALIGN_CENTER, &FreeSansBold24pt7b, 4);
+  printAligned(title, centerX, BOTTOM_AREA.y + 19, ALIGN_CENTER);
+  drawTemperature(temperature, centerX, BOTTOM_AREA.y + 56, ALIGN_CENTER, &FreeSansBold24pt7b, 4);
   display.setFont(&FreeSans12pt7b);
-  printAligned(detail, centerX, BOTTOM_AREA.y + 86, ALIGN_CENTER);
+  printAligned(detail, centerX, BOTTOM_AREA.y + 78, ALIGN_CENTER);
+  if (detail2 != nullptr) {
+    display.setFont(&FreeSans9pt7b);
+    printAligned(detail2, centerX, BOTTOM_AREA.y + 94, ALIGN_CENTER);
+  }
 }
 
 void drawBottomContent() {
@@ -869,6 +933,7 @@ void drawBottomContent() {
 
   char humRdcStr[16];
   char humEtageStr[16];
+  char pressureStr[16];
   if (humidityRDC >= 0) {
     snprintf(humRdcStr, sizeof(humRdcStr), "%d %%", humidityRDC);
   } else {
@@ -879,40 +944,19 @@ void drawBottomContent() {
   } else {
     strcpy(humEtageStr, "-- %");
   }
-
-  drawMeasureColumn("EXTERIEUR", col1, tempExterior, conditionLabel(weatherCondition));
-  drawMeasureColumn("RDC", col2, tempRDC, humRdcStr);
-  drawMeasureColumn("ETAGE", col3, tempEtage, humEtageStr);
-
-  // Ligne du bas, pleine largeur : vent et rafales à gauche, pression à droite.
-  display.setFont(&FreeSans9pt7b);
-  const int infoBaseline = BOTTOM_AREA.y + BOTTOM_AREA.h - 6;
-  const int arrowSize = 22;
-  if (isnan(windSpeedKmh) || isnan(windBearingDegrees)) {
-    printAligned("Vent --", SCREEN_MARGIN, infoBaseline, ALIGN_LEFT);
-  } else {
-    char windStr[40];
-    if (isnan(windGustKmh)) {
-      snprintf(windStr, sizeof(windStr), "%.0f km/h %s", windSpeedKmh, compassPoint(windBearingDegrees));
-    } else {
-      snprintf(windStr, sizeof(windStr), "%.0f km/h %s, rafales %.0f", windSpeedKmh,
-               compassPoint(windBearingDegrees), windGustKmh);
-    }
-    drawWindArrow(SCREEN_MARGIN + arrowSize / 2, infoBaseline - 5, windBearingDegrees, arrowSize);
-    printAligned(windStr, SCREEN_MARGIN + arrowSize + 6, infoBaseline, ALIGN_LEFT);
-  }
-  char pressureStr[16];
   if (pressureAtmospheric >= 0) {
     snprintf(pressureStr, sizeof(pressureStr), "%d hPa", pressureAtmospheric);
   } else {
     strcpy(pressureStr, "-- hPa");
   }
-  printAligned(pressureStr, width - SCREEN_MARGIN, infoBaseline, ALIGN_RIGHT);
+
+  drawMeasureColumn("EXTERIEUR", col1, tempExterior, conditionLabel(weatherCondition), pressureStr);
+  drawMeasureColumn("RDC", col2, tempRDC, humRdcStr, nullptr);
+  drawMeasureColumn("ETAGE", col3, tempEtage, humEtageStr, nullptr);
 
   display.fillRect(SCREEN_MARGIN, BOTTOM_AREA.y, width - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
-  // Les séparateurs s'arrêtent au-dessus de la ligne du bas.
   const int separatorTop = BOTTOM_AREA.y + 10;
-  const int separatorHeight = 82;
+  const int separatorHeight = BOTTOM_AREA.h - 18;
   display.drawFastVLine(SCREEN_MARGIN + columnWidth, separatorTop, separatorHeight, GxEPD_BLACK);
   display.drawFastVLine(SCREEN_MARGIN + 2 * columnWidth, separatorTop, separatorHeight, GxEPD_BLACK);
 }
@@ -934,6 +978,10 @@ void updateTideSection() {
   refreshArea(TIDE_AREA, drawTideContent);
 }
 
+void updateWindSection() {
+  refreshArea(WIND_AREA, drawWindContent);
+}
+
 void updateBottomSection() {
   refreshArea(BOTTOM_AREA, drawBottomContent);
 }
@@ -947,6 +995,7 @@ void displayWeatherStation() {
     display.fillScreen(GxEPD_WHITE);
     drawHeaderContent();
     drawTideContent();
+    drawWindContent();
     drawBottomContent();
   } while (display.nextPage());
   display.powerOff();
@@ -958,12 +1007,17 @@ void displayWeatherStation() {
 }
 
 // Rafraîchit les zones marquées comme modifiées. C'est le seul endroit qui
-// consomme les drapeaux gXxxNeedsUpdate.
+// consomme les drapeaux gXxxNeedsUpdate. gExteriorNeedsUpdate couvre aussi
+// la prévision : elle alimente la bande vent et la condition météo.
 void refreshDirtySections() {
   bool refreshed = false;
   if (gTideNeedsUpdate) {
     gTideNeedsUpdate = false;
     updateTideSection();
+    refreshed = true;
+  }
+  if (gExteriorNeedsUpdate) {
+    updateWindSection();
     refreshed = true;
   }
   if (gExteriorNeedsUpdate || gGroundNeedsUpdate || gUpperNeedsUpdate) {
