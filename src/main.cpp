@@ -49,18 +49,15 @@
 // GxEPD2_420 pour 4.2" 400x300
 GxEPD2_BW<GxEPD2_420, GxEPD2_420::HEIGHT> display(GxEPD2_420(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 
-// ========== DONNÉES SIMULÉES ==========
-// Heure et date
-int currentHour = 14;
-int currentMinute = 32;
-String dayName = "Vendredi";
-int dayNumber = 7;
-String monthName = "Novembre";
-int year = 2025;
+// ========== ÉTAT AFFICHÉ ==========
+// Heure locale courante. gTimeValid reste faux tant que l'horloge n'a jamais
+// été synchronisée : on affiche alors "--:--" plutôt qu'une date inventée.
+struct tm gNow = {};
+bool gTimeValid = false;
 
 // Phase lunaire (0-7: 0=Nouvelle, 2=Premier quartier, 4=Pleine, 6=Dernier quartier)
-int moonPhase = 1;
-int moonIllumination = 63; // pourcentage de la surface éclairée
+int moonPhase = 0;
+int moonIllumination = -1; // pourcentage de la surface éclairée, -1 = inconnu
 
 // Marée
 bool isTideRising = true;  // true = montante, false = descendante
@@ -86,30 +83,44 @@ int humidityRDC = -1;
 float tempEtage = NAN;
 int humidityEtage = -1;
 
+// Instant (millis) de la dernière valeur reçue pour chaque source, afin de
+// neutraliser l'affichage si Home Assistant cesse de publier.
+unsigned long gOutdoorReceivedMs = 0;
+unsigned long gGroundReceivedMs = 0;
+unsigned long gFloorReceivedMs = 0;
+
 // WiFi
 const char* WIFI_SSID = STATION_WIFI_SSID;
 const char* WIFI_PASSWORD = STATION_WIFI_PASSWORD;
-constexpr uint8_t WIFI_MAX_RETRIES = 5;
-constexpr unsigned long WIFI_RETRY_DELAY_MS = 2000;
 constexpr const char* TZ_EUROPE_PARIS = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 constexpr const char* NTP_SERVER_1 = "fr.pool.ntp.org";
 constexpr const char* NTP_SERVER_2 = "pool.ntp.org";
 constexpr const char* NTP_SERVER_3 = "time.google.com";
 
-const char* const FRENCH_DAY_NAMES[7] = {
-  "Dimanche", "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi"
+const char* const FRENCH_DAY_ABBREVIATIONS[7] = {
+  "Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"
 };
 
-const char* const FRENCH_MONTH_NAMES[12] = {
-  "Janvier", "Fevrier", "Mars", "Avril", "Mai", "Juin",
-  "Juillet", "Aout", "Septembre", "Octobre", "Novembre", "Decembre"
+const char* const FRENCH_MONTH_ABBREVIATIONS[12] = {
+  "Jan", "Fev", "Mar", "Avr", "Mai", "Jun",
+  "Jul", "Aou", "Sep", "Oct", "Nov", "Dec"
 };
 const char* MQTT_HOST = STATION_MQTT_HOST;
 constexpr uint16_t MQTT_PORT = 1883;
 const char* MQTT_USERNAME = STATION_MQTT_USERNAME;
 const char* MQTT_PASSWORD = STATION_MQTT_PASSWORD;
-constexpr uint8_t MQTT_MAX_RETRIES = 5;
-constexpr unsigned long MQTT_RETRY_DELAY_MS = 2000;
+// Une seule tentative de connexion par intervalle : la boucle ne doit jamais
+// rester bloquée plusieurs secondes, sinon l'horloge affichée prend du retard.
+constexpr unsigned long NETWORK_RETRY_INTERVAL_MS = 30000UL;
+constexpr unsigned long WIFI_FORCE_RECONNECT_AFTER_MS = 120000UL;
+constexpr uint16_t MQTT_SOCKET_TIMEOUT_S = 5;
+// Au-delà, une mesure n'est plus affichée (HA arrêté, capteur muet...).
+constexpr unsigned long DATA_STALE_AFTER_MS = 3UL * 3600UL * 1000UL;
+constexpr time_t FORECAST_STALE_AFTER_S = 3 * 3600;
+// Rafraîchissement complet périodique contre la rémanence des mises à jour partielles.
+constexpr int FULL_REFRESH_EVERY_MINUTES = 60;
+// Un horodatage antérieur à 2020 signifie que l'horloge n'a jamais été réglée.
+constexpr time_t MIN_VALID_EPOCH = 1577836800;
 constexpr const char* TOPIC_TIDE = "station/tide";
 constexpr const char* TOPIC_OUTDOOR = "station/outdoor";
 constexpr const char* TOPIC_GROUND = "station/ground";
@@ -125,6 +136,13 @@ constexpr size_t MAX_BITMAP_PIXELS = (MAX_PIXELS_MOON > MAX_PIXELS_ROOM)
 constexpr size_t MAX_MONO_BITMAP_BYTES = MAX_BITMAP_PIXELS / 8;
 constexpr double SYNODIC_MONTH_DAYS = 29.530588853;
 constexpr double KNOWN_NEW_MOON_JD = 2451550.1;  // 6 janvier 2000 18:14 UTC
+constexpr double UNIX_EPOCH_JD = 2440587.5;
+
+#if ENABLE_STATION_LOGS
+constexpr uint32_t DISPLAY_DIAG_BAUD = 115200;
+#else
+constexpr uint32_t DISPLAY_DIAG_BAUD = 0;  // pas de traces GxEPD2 en production
+#endif
 
 struct TideEvent {
   time_t ts;
@@ -283,126 +301,46 @@ void updateMiddleSeparator();
 void updateInteriorSection();
 void updateInteriorSeparator();
 bool updateTideForecastFromStoredEvents();
-void connectToWiFi();
-void connectToMQTT();
+void serviceNetwork();
+bool connectToMQTT();
 void handleMqttMessage(char* topic, byte* payload, unsigned int length);
 void updateMoonData();
-int monthNumberFromName(const String& name);
-double computeJulianDay(int year, int month, int day, int hour, int minute);
-bool updateDateTimeFromNTP();
+bool updateDateTimeFromClock();
+bool currentEpoch(time_t& out);
 bool parseIso8601ToTime(const char* iso, time_t& outEpoch);
 bool loadTideDataFromJson(const char* payload, size_t length = 0);
 bool loadForecastFromJson(const char* payload, size_t length = 0);
 bool updateForecastFromStoredData();
 void drawWindArrow(int centerX, int centerY, float bearingDegrees, int size);
 
-String abbreviateDay(const String& name) {
-  if (name.equalsIgnoreCase("Lundi")) return "Lun";
-  if (name.equalsIgnoreCase("Mardi")) return "Mar";
-  if (name.equalsIgnoreCase("Mercredi")) return "Mer";
-  if (name.equalsIgnoreCase("Jeudi")) return "Jeu";
-  if (name.equalsIgnoreCase("Vendredi")) return "Ven";
-  if (name.equalsIgnoreCase("Samedi")) return "Sam";
-  if (name.equalsIgnoreCase("Dimanche")) return "Dim";
-  int len = name.length();
-  int count = len >= 3 ? 3 : len;
-  return name.substring(0, count);
-}
-
-String abbreviateMonth(const String& name) {
-  if (name.equalsIgnoreCase("Janvier")) return "Jan";
-  if (name.equalsIgnoreCase("Fevrier")) return "Fev";
-  if (name.equalsIgnoreCase("Mars")) return "Mar";
-  if (name.equalsIgnoreCase("Avril")) return "Avr";
-  if (name.equalsIgnoreCase("Mai")) return "Mai";
-  if (name.equalsIgnoreCase("Juin")) return "Jun";
-  if (name.equalsIgnoreCase("Juillet")) return "Jul";
-  if (name.equalsIgnoreCase("Aout")) return "Aou";
-  if (name.equalsIgnoreCase("Septembre")) return "Sep";
-  if (name.equalsIgnoreCase("Octobre")) return "Oct";
-  if (name.equalsIgnoreCase("Novembre")) return "Nov";
-  if (name.equalsIgnoreCase("Decembre")) return "Dec";
-  int len = name.length();
-  int count = len >= 3 ? 3 : len;
-  return name.substring(0, count);
-}
-
-int monthNumberFromName(const String& name) {
-  if (name.equalsIgnoreCase("Janvier")) return 1;
-  if (name.equalsIgnoreCase("Fevrier")) return 2;
-  if (name.equalsIgnoreCase("Février")) return 2;
-  if (name.equalsIgnoreCase("Mars")) return 3;
-  if (name.equalsIgnoreCase("Avril")) return 4;
-  if (name.equalsIgnoreCase("Mai")) return 5;
-  if (name.equalsIgnoreCase("Juin")) return 6;
-  if (name.equalsIgnoreCase("Juillet")) return 7;
-  if (name.equalsIgnoreCase("Aout")) return 8;
-  if (name.equalsIgnoreCase("Août")) return 8;
-  if (name.equalsIgnoreCase("Septembre")) return 9;
-  if (name.equalsIgnoreCase("Octobre")) return 10;
-  if (name.equalsIgnoreCase("Novembre")) return 11;
-  if (name.equalsIgnoreCase("Decembre")) return 12;
-  if (name.equalsIgnoreCase("Décembre")) return 12;
-  return 0;
-}
-
-double computeJulianDay(int year, int month, int day, int hour, int minute) {
-  int a = (14 - month) / 12;
-  int y = year + 4800 - a;
-  int m = month + 12 * a - 3;
-  long jdn = day + ((153 * m + 2) / 5) + 365L * y + y / 4 - y / 100 + y / 400 - 32045;
-  double dayFraction = (static_cast<double>(hour) + static_cast<double>(minute) / 60.0) / 24.0;
-  return static_cast<double>(jdn) + dayFraction - 0.5;
-}
-
-bool updateDateTimeFromNTP() {
-  if (WiFi.status() != WL_CONNECTED) {
+bool currentEpoch(time_t& out) {
+  const time_t nowTs = time(nullptr);
+  if (nowTs < MIN_VALID_EPOCH) {
     return false;
   }
+  out = nowTs;
+  return true;
+}
 
-  static bool timeConfigured = false;
-  if (!timeConfigured) {
-    configTzTime(TZ_EUROPE_PARIS, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
-    timeConfigured = true;
+// Lit l'horloge interne de l'ESP32. Une fois réglée par NTP elle continue de
+// tourner sans réseau : une coupure WiFi ne doit donc pas figer l'heure.
+// Renvoie vrai si la minute affichée a changé.
+bool updateDateTimeFromClock() {
+  time_t nowTs = 0;
+  if (!currentEpoch(nowTs)) {
+    return false;
   }
-
   struct tm timeinfo;
-  constexpr uint8_t maxAttempts = 10;
-  constexpr uint16_t attemptDelayMs = 500;
-  bool timeObtained = false;
-  for (uint8_t attempt = 0; attempt < maxAttempts; ++attempt) {
-    if (getLocalTime(&timeinfo, 500)) {
-      timeObtained = true;
-      break;
-    }
-    delay(attemptDelayMs);
-  }
-
-  if (!timeObtained) {
-    STATION_LOG_PRINTLN("Echec de la récupération NTP");
+  if (localtime_r(&nowTs, &timeinfo) == nullptr) {
     return false;
   }
 
-  // (Synchronisation minute déplacée dans setup, rien ici)
-
-  int newHour = timeinfo.tm_hour;
-  int newMinute = timeinfo.tm_min;
-  int newDay = timeinfo.tm_mday;
-  int newYear = timeinfo.tm_year + 1900;
-  const char* newDayName = FRENCH_DAY_NAMES[timeinfo.tm_wday % 7];
-  const char* newMonthName = FRENCH_MONTH_NAMES[timeinfo.tm_mon % 12];
-
-  bool changed = (currentMinute != newMinute) || (currentHour != newHour) ||
-                 (dayNumber != newDay) || (year != newYear) ||
-                 (!dayName.equals(newDayName)) || (!monthName.equals(newMonthName));
-
-  currentHour = newHour;
-  currentMinute = newMinute;
-  dayNumber = newDay;
-  year = newYear;
-  dayName = newDayName;
-  monthName = newMonthName;
-
+  const bool changed = !gTimeValid ||
+                       (gNow.tm_min != timeinfo.tm_min) || (gNow.tm_hour != timeinfo.tm_hour) ||
+                       (gNow.tm_mday != timeinfo.tm_mday) || (gNow.tm_mon != timeinfo.tm_mon) ||
+                       (gNow.tm_year != timeinfo.tm_year);
+  gNow = timeinfo;
+  gTimeValid = true;
   return changed;
 }
 
@@ -601,23 +539,10 @@ bool updateTideForecastFromStoredEvents() {
     return false;
   }
 
-  time_t nowTs = time(nullptr);
-  if (nowTs <= 0) {
-    struct tm tmNow = {};
-    tmNow.tm_year = year - 1900;
-    int monthIdx = monthNumberFromName(monthName) - 1;
-    if (monthIdx < 0) {
-      monthIdx = 0;
-    }
-    tmNow.tm_mon = monthIdx;
-    tmNow.tm_mday = dayNumber;
-    tmNow.tm_hour = currentHour;
-    tmNow.tm_min = currentMinute;
-    tmNow.tm_sec = 0;
-    tmNow.tm_isdst = -1;
-    nowTs = mktime(&tmNow);
-  }
-  if (nowTs <= 0) {
+  // Sans heure fiable on ne sait pas quelle marée est la prochaine : le calcul
+  // sera refait au premier tick d'horloge valide.
+  time_t nowTs = 0;
+  if (!currentEpoch(nowTs)) {
     return false;
   }
 
@@ -711,31 +636,14 @@ bool updateTideForecastFromStoredEvents() {
 }
 
 void updateMoonData() {
-  // computeJulianDay attend une date UTC, puisque KNOWN_NEW_MOON_JD est une
-  // référence UTC. Les globales currentHour/currentMinute sont en heure de
-  // Paris : les utiliser telles quelles décalait la phase d'une à deux heures.
-  int utcYear = year;
-  int utcMonth = monthNumberFromName(monthName);
-  int utcDay = dayNumber;
-  int utcHour = currentHour;
-  int utcMinute = currentMinute;
-
-  const time_t nowTs = time(nullptr);
-  struct tm utcTm;
-  if (nowTs > 0 && gmtime_r(&nowTs, &utcTm) != nullptr) {
-    utcYear = utcTm.tm_year + 1900;
-    utcMonth = utcTm.tm_mon + 1;
-    utcDay = utcTm.tm_mday;
-    utcHour = utcTm.tm_hour;
-    utcMinute = utcTm.tm_min;
-  }
-
-  const int month = utcMonth;
-  if (month <= 0) {
+  // Le jour julien se déduit directement de l'epoch (UTC), comme la référence
+  // KNOWN_NEW_MOON_JD : aucun fuseau horaire n'intervient.
+  time_t nowTs = 0;
+  if (!currentEpoch(nowTs)) {
     return;
   }
 
-  double jd = computeJulianDay(utcYear, month, utcDay, utcHour, utcMinute);
+  double jd = UNIX_EPOCH_JD + static_cast<double>(nowTs) / 86400.0;
   double daysSinceNew = jd - KNOWN_NEW_MOON_JD;
   double phaseCycle = fmod(daysSinceNew, SYNODIC_MONTH_DAYS);
   if (phaseCycle < 0.0) {
@@ -795,17 +703,19 @@ void drawHeaderContent() {
   const int leftAnchor = leftColumnAnchor();
   const int rightAnchor = rightColumnAnchor();
 
-  String timeStr;
-  if (currentHour < 10) timeStr += "0";
-  timeStr += String(currentHour) + ":";
-  if (currentMinute < 10) timeStr += "0";
-  timeStr += String(currentMinute);
+  char timeStr[6] = "--:--";
+  char dateStr[24] = "";
+  if (gTimeValid) {
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d", gNow.tm_hour, gNow.tm_min);
+    snprintf(dateStr, sizeof(dateStr), "%s %d %s %d",
+             FRENCH_DAY_ABBREVIATIONS[gNow.tm_wday % 7], gNow.tm_mday,
+             FRENCH_MONTH_ABBREVIATIONS[gNow.tm_mon % 12], gNow.tm_year + 1900);
+  }
 
   display.setFont(&FreeSansBold24pt7b);
   display.setCursor(leftAnchor, 55);
   display.print(timeStr);
 
-  String dateStr = abbreviateDay(dayName) + " " + String(dayNumber) + " " + abbreviateMonth(monthName) + " " + String(year);
   display.setFont(&FreeSans12pt7b);
   display.setCursor(leftAnchor + 4, 78);
   display.print(dateStr);
@@ -818,14 +728,16 @@ void drawHeaderContent() {
 
   display.setFont(&FreeSans9pt7b);
   int16_t tbx, tby; uint16_t tbw, tbh;
-  String moonText = String(moonIllumination) + "%";
+  String moonText = (moonIllumination >= 0) ? (String(moonIllumination) + "%") : String("--%");
   display.getTextBounds(moonText, 0, 0, &tbx, &tby, &tbw, &tbh);
 
   int blockHeight = iconDiameter + textSpacing + tbh;
   int blockTop = headerTop + (headerHeight - blockHeight) / 2;
   int moonCenterY = blockTop + iconDiameter / 2;
 
-  drawMoonPhase(moonCenterX, moonCenterY, moonPhase);
+  if (moonIllumination >= 0) {
+    drawMoonPhase(moonCenterX, moonCenterY, moonPhase);
+  }
 
   int textBaseline = blockTop + iconDiameter + textSpacing - tby;
   int textX = moonCenterX - (tbw / 2) - tbx;
@@ -841,8 +753,10 @@ void drawTidePanel(const Rect& area) {
   const int w = area.w;
   const int h = area.h;
 
-  // Marée: 0 = descendante (LOW), 1 = montante (HIGH)
-  const unsigned char* iconBitmap = tide_bitmap_allArray[(isTideRising && tideCoefficient >= 0) ? 1 : 0];
+  // Marée: 0 = descendante (LOW), 1 = montante (HIGH). Le sens ne dépend que
+  // de la validité de la prochaine marée, pas de la présence d'un coefficient.
+  const bool tideKnown = nextTideEpoch != 0;
+  const unsigned char* iconBitmap = tide_bitmap_allArray[isTideRising ? 1 : 0];
   const int iconSize = TIDE_ICON_SIZE;
   const int iconSpacing = 12;
   const int textSpacing = 6;
@@ -891,7 +805,9 @@ void drawTidePanel(const Rect& area) {
 
   int iconLeft = iconBlockLeft + (iconBlockWidth - iconSize) / 2;
   int iconTop = iconBlockTop + coefTbh + coefSpacingAboveIcon;
-  drawBitmapBlackOnWhite(iconLeft, iconTop, iconBitmap, iconSize, iconSize);
+  if (tideKnown) {
+    drawBitmapBlackOnWhite(iconLeft, iconTop, iconBitmap, iconSize, iconSize);
+  }
 
   int currentY = textTop;
 
@@ -1180,187 +1096,254 @@ void updateInteriorSeparator() {
     drawVerticalSeparator(rect);
   } while (display.nextPage());
 }
+
+// Rafraîchissement complet en une seule passe : efface la rémanence laissée
+// par les mises à jour partielles successives.
 void displayWeatherStation() {
   display.setFullWindow();
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
-  }
-  while (display.nextPage());
+    drawHeaderContent();
+    drawInteriorPanel(gLayout.interior);
+    drawVerticalSeparator(gLayout.interiorSeparator);
+    drawThickSeparator(gLayout.middleSeparator);
+    drawTidePanel(gLayout.tide);
+    drawVerticalSeparator(gLayout.centralSeparator);
+    drawExteriorPanel(gLayout.exterior);
+  } while (display.nextPage());
+  display.powerOff();
 
+  gExteriorNeedsUpdate = false;
+  gTideNeedsUpdate = false;
+  gGroundNeedsUpdate = false;
+  gUpperNeedsUpdate = false;
+}
+
+// Rafraîchit les zones marquées comme modifiées. C'est le seul endroit qui
+// consomme les drapeaux gXxxNeedsUpdate.
+void refreshDirtySections() {
+  bool refreshed = false;
+  if (gExteriorNeedsUpdate) {
+    gExteriorNeedsUpdate = false;
+    updateExteriorSection();
+    refreshed = true;
+  }
+  if (gTideNeedsUpdate) {
+    gTideNeedsUpdate = false;
+    updateTideSection();
+    refreshed = true;
+  }
+  if (gGroundNeedsUpdate || gUpperNeedsUpdate) {
+    gGroundNeedsUpdate = false;
+    gUpperNeedsUpdate = false;
+    updateInteriorSection();
+    refreshed = true;
+  }
+  if (refreshed) {
+    display.powerOff();
+  }
+}
+
+static bool isStale(unsigned long receivedMs, unsigned long nowMs) {
+  return (nowMs - receivedMs) >= DATA_STALE_AFTER_MS;
+}
+
+// Efface les mesures que Home Assistant n'a plus publiées depuis trop
+// longtemps, pour ne pas afficher indéfiniment une valeur figée.
+void expireStaleMeasurements() {
+  const unsigned long nowMs = millis();
+  if ((!isnan(tempExterior) || pressureAtmospheric >= 0) && isStale(gOutdoorReceivedMs, nowMs)) {
+    tempExterior = NAN;
+    pressureAtmospheric = -1;
+    gExteriorNeedsUpdate = true;
+  }
+  if ((!isnan(tempRDC) || humidityRDC >= 0) && isStale(gGroundReceivedMs, nowMs)) {
+    tempRDC = NAN;
+    humidityRDC = -1;
+    gGroundNeedsUpdate = true;
+  }
+  if ((!isnan(tempEtage) || humidityEtage >= 0) && isStale(gFloorReceivedMs, nowMs)) {
+    tempEtage = NAN;
+    humidityEtage = -1;
+    gUpperNeedsUpdate = true;
+  }
+}
+
+// Travail fait à chaque changement de minute.
+void onMinuteTick() {
+  static int minutesSinceFullRefresh = 0;
+  updateMoonData();
+  updateTideForecastFromStoredEvents();
+  updateForecastFromStoredData();
+  expireStaleMeasurements();
+
+  if (++minutesSinceFullRefresh >= FULL_REFRESH_EVERY_MINUTES) {
+    minutesSinceFullRefresh = 0;
+    displayWeatherStation();
+    return;
+  }
   updateHeaderSection();
-  updateInteriorSection();
-  updateMiddleSeparator();
-  updateTideSection();
-  updateExteriorSection();
+  refreshDirtySections();
+  display.powerOff();
 }
 
 void setup() {
   STATION_LOG_BEGIN(115200);
   STATION_LOG_PRINTLN("Démarrage de la station météo e-paper");
 
-  connectToWiFi();
-  if (!updateDateTimeFromNTP()) {
-    STATION_LOG_PRINTLN("Synchronisation NTP initiale échouée");
-  } else {
-    // Attendre le début de la prochaine minute UNE SEULE FOIS
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo, 500)) {
-      int sec = timeinfo.tm_sec;
-      if (sec > 0 && sec < 60) {
-        int waitMs = (60 - sec) * 1000;
-        STATION_LOG_PRINTF("Attente de %d secondes pour aligner l'affichage sur la minute suivante...\n", 60 - sec);
-        delay(waitMs);
-      }
-    }
-  }
-  connectToMQTT();
+  // Fuseau posé tout de suite : localtime_r est correct dès la synchro NTP.
+  setenv("TZ", TZ_EUROPE_PARIS, 1);
+  tzset();
 
-  // Initialisation de l'écran
-  display.init(115200);
+  display.init(DISPLAY_DIAG_BAUD);
   display.setRotation(0); // Mode paysage (400x300)
   computeLayout();
-  updateMoonData();
 
-  // Affichage initial
+  // Laisser au réseau le temps de fournir l'heure et les messages MQTT
+  // retenus, pour que le premier affichage soit complet. Sans réseau, on
+  // affiche quand même au bout du délai.
+  constexpr unsigned long BOOT_NETWORK_WAIT_MS = 20000UL;
+  constexpr unsigned long BOOT_RETAINED_WAIT_MS = 2000UL;
+  const unsigned long bootStart = millis();
+  unsigned long mqttConnectedAt = 0;
+  bool mqttSeen = false;
+  while (millis() - bootStart < BOOT_NETWORK_WAIT_MS) {
+    serviceNetwork();
+    if (gMqttClient.connected() && !mqttSeen) {
+      mqttSeen = true;
+      mqttConnectedAt = millis();
+    }
+    updateDateTimeFromClock();
+    if (gTimeValid && mqttSeen && millis() - mqttConnectedAt >= BOOT_RETAINED_WAIT_MS) {
+      break;
+    }
+    delay(50);
+  }
+
+  updateDateTimeFromClock();
+  updateMoonData();
+  updateTideForecastFromStoredEvents();
+  updateForecastFromStoredData();
   displayWeatherStation();
 
   STATION_LOG_PRINTLN("Affichage initial terminé");
 }
 
-// Cadence de resynchronisation de l'heure et de la phase lunaire.
-constexpr unsigned long CLOCK_REFRESH_INTERVAL_MS = 60000UL;
-
-// Entretien réseau + rafraîchissement des zones marquées comme modifiées.
-// Appelé à chaque tour de boucle, c'est le seul endroit qui consomme les
-// drapeaux gXxxNeedsUpdate.
-void serviceNetworkAndDisplay() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectToWiFi();
-  }
-  if (!gMqttClient.connected()) {
-    connectToMQTT();
-  }
-  if (gMqttClient.connected()) {
-    gMqttClient.loop();
-  }
-
-  if (gExteriorNeedsUpdate) {
-    gExteriorNeedsUpdate = false;
-    updateExteriorSection();
-  }
-  if (gTideNeedsUpdate) {
-    gTideNeedsUpdate = false;
-    updateTideSection();
-  }
-  if (gGroundNeedsUpdate || gUpperNeedsUpdate) {
-    gGroundNeedsUpdate = false;
-    gUpperNeedsUpdate = false;
-    updateInteriorSection();
-  }
-}
-
 void loop() {
-  static unsigned long lastClockRefreshMs = 0;
+  serviceNetwork();
 
-  serviceNetworkAndDisplay();
-
-  // millis() déborde au bout de ~49 jours : la soustraction non signée reste
-  // correcte au passage, contrairement à une comparaison directe.
-  const unsigned long now = millis();
-  if (lastClockRefreshMs == 0 || (now - lastClockRefreshMs) >= CLOCK_REFRESH_INTERVAL_MS) {
-    lastClockRefreshMs = now;
-    const bool timeUpdated = updateDateTimeFromNTP();
-    updateMoonData();
-    if (timeUpdated) {
-      updateHeaderSection();
-      updateTideForecastFromStoredEvents();
-      updateForecastFromStoredData();
-      serviceNetworkAndDisplay();  // consomme les drapeaux que ces appels viennent de poser
-    }
+  // L'horloge est relue souvent et le rafraîchissement suit le changement de
+  // minute : l'affichage reste calé sur la minute réelle même après une
+  // opération bloquante.
+  if (updateDateTimeFromClock()) {
+    onMinuteTick();
+  } else {
+    refreshDirtySections();
   }
 
-  delay(1000);
+  delay(200);
 }
 
-void connectToWiFi() {
-  if (WiFi.status() == WL_CONNECTED) {
+// Maintenance réseau non bloquante : au plus une tentative de connexion MQTT
+// par intervalle, la reconnexion WiFi étant confiée à la pile ESP32.
+void serviceNetwork() {
+  static bool wifiStarted = false;
+  static bool timeConfigured = false;
+  static bool mqttAttempted = false;
+  static unsigned long lastMqttAttemptMs = 0;
+  static unsigned long wifiLostSinceMs = 0;
+  static bool wifiWasConnected = false;
+  const unsigned long nowMs = millis();
+
+  if (!wifiStarted) {
+    wifiStarted = true;
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    wifiLostSinceMs = nowMs;
+    STATION_LOG_PRINT("Connexion WiFi à ");
+    STATION_LOG_PRINTLN(WIFI_SSID);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiWasConnected) {
+      wifiWasConnected = false;
+      wifiLostSinceMs = nowMs;
+      STATION_LOG_PRINTLN("WiFi perdu");
+    } else if (nowMs - wifiLostSinceMs >= WIFI_FORCE_RECONNECT_AFTER_MS) {
+      // Filet de sécurité si la reconnexion automatique ne reprend pas.
+      wifiLostSinceMs = nowMs;
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      STATION_LOG_PRINTLN("WiFi: reconnexion forcée");
+    }
     return;
   }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  STATION_LOG_PRINT("Connexion WiFi à ");
-  STATION_LOG_PRINTLN(WIFI_SSID);
-
-  uint8_t attempt = 0;
-  while (WiFi.status() != WL_CONNECTED && attempt < WIFI_MAX_RETRIES) {
-    delay(WIFI_RETRY_DELAY_MS);
-    STATION_LOG_PRINT(".");
-    ++attempt;
-  }
-  STATION_LOG_PRINTLN();
-
-  if (WiFi.status() == WL_CONNECTED) {
+  if (!wifiWasConnected) {
+    wifiWasConnected = true;
     STATION_LOG_PRINT("WiFi connecté, IP: ");
     STATION_LOG_PRINTLN(WiFi.localIP());
-    updateDateTimeFromNTP();
+  }
+
+  if (!timeConfigured) {
+    // Synchronisation SNTP en tâche de fond, renouvelée automatiquement.
+    configTzTime(TZ_EUROPE_PARIS, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+    timeConfigured = true;
+  }
+
+  if (gMqttClient.connected()) {
+    gMqttClient.loop();
+    return;
+  }
+  if (!mqttAttempted || nowMs - lastMqttAttemptMs >= NETWORK_RETRY_INTERVAL_MS) {
+    mqttAttempted = true;
+    lastMqttAttemptMs = nowMs;
     connectToMQTT();
-  } else {
-    STATION_LOG_PRINTLN("Impossible de se connecter au WiFi");
   }
 }
 
-void connectToMQTT() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-  if (gMqttClient.connected()) {
-    return;
-  }
-
-  gMqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  if (!gMqttClient.setBufferSize(MQTT_BUFFER_SIZE_BYTES)) {
-    // Sans ce contrôle, un échec d'allocation se traduisait par des messages
-    // tronqués silencieusement, donc par un JSON invalide.
-    STATION_LOG_PRINTLN("Echec d'allocation du buffer MQTT");
-  }
-  gMqttClient.setCallback(handleMqttMessage);
-
-  uint8_t attempt = 0;
-  while (!gMqttClient.connected() && attempt < MQTT_MAX_RETRIES) {
-    String clientId = "epd-station-";
-    clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
-    bool connected = false;
-    if (MQTT_USERNAME != nullptr && MQTT_USERNAME[0] != '\0') {
-      connected = gMqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD);
-    } else {
-      connected = gMqttClient.connect(clientId.c_str());
+bool connectToMQTT() {
+  static bool configured = false;
+  if (!configured) {
+    configured = true;
+    gMqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    gMqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
+    if (!gMqttClient.setBufferSize(MQTT_BUFFER_SIZE_BYTES)) {
+      // Sans ce contrôle, un échec d'allocation se traduisait par des messages
+      // tronqués silencieusement, donc par un JSON invalide.
+      STATION_LOG_PRINTLN("Echec d'allocation du buffer MQTT");
     }
-    if (connected) {
-      STATION_LOG_PRINTLN("MQTT connecté");
-      auto subscribeAndLog = [&](const char* topic) {
-        bool ok = gMqttClient.subscribe(topic);
-        STATION_LOG_PRINT("Souscription ");
-        STATION_LOG_PRINT(topic);
-        STATION_LOG_PRINTLN(ok ? " OK" : " ECHEC");
-      };
-      subscribeAndLog(TOPIC_TIDE);
-      subscribeAndLog(TOPIC_OUTDOOR);
-      subscribeAndLog(TOPIC_GROUND);
-      subscribeAndLog(TOPIC_FLOOR);
-      subscribeAndLog(TOPIC_FORECAST);
-      break;
-    }
-    ++attempt;
-    STATION_LOG_PRINTLN("Nouvelle tentative MQTT...");
-    delay(MQTT_RETRY_DELAY_MS);
+    gMqttClient.setCallback(handleMqttMessage);
   }
 
-  if (!gMqttClient.connected()) {
-    STATION_LOG_PRINTLN("Impossible de se connecter au broker MQTT");
+  String clientId = "epd-station-";
+  clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
+  bool connected = false;
+  if (MQTT_USERNAME != nullptr && MQTT_USERNAME[0] != '\0') {
+    connected = gMqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD);
+  } else {
+    connected = gMqttClient.connect(clientId.c_str());
   }
+  if (!connected) {
+    STATION_LOG_PRINTF("Connexion MQTT impossible (état %d)\n", gMqttClient.state());
+    return false;
+  }
+
+  STATION_LOG_PRINTLN("MQTT connecté");
+  auto subscribeAndLog = [&](const char* topic) {
+    bool ok = gMqttClient.subscribe(topic);
+    STATION_LOG_PRINT("Souscription ");
+    STATION_LOG_PRINT(topic);
+    STATION_LOG_PRINTLN(ok ? " OK" : " ECHEC");
+  };
+  subscribeAndLog(TOPIC_TIDE);
+  subscribeAndLog(TOPIC_OUTDOOR);
+  subscribeAndLog(TOPIC_GROUND);
+  subscribeAndLog(TOPIC_FLOOR);
+  subscribeAndLog(TOPIC_FORECAST);
+  return true;
 }
 
 void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
@@ -1403,6 +1386,9 @@ void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
     JsonVariantConst tempVar = doc["temperature"];
     if (tempVar.is<float>()) {
       float newTemp = tempVar.as<float>();
+      if (!isnan(newTemp)) {
+        gOutdoorReceivedMs = millis();
+      }
       if (!isnan(newTemp) && (isnan(tempExterior) || fabsf(newTemp - tempExterior) > 0.01f)) {
         tempExterior = newTemp;
         updated = true;
@@ -1412,6 +1398,7 @@ void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
     if (pressureVar.is<float>()) {
       float newPressure = pressureVar.as<float>();
       if (!isnan(newPressure)) {
+        gOutdoorReceivedMs = millis();
         int rounded = static_cast<int>(roundf(newPressure));
         if (rounded != pressureAtmospheric) {
           pressureAtmospheric = rounded;
@@ -1425,11 +1412,15 @@ void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  auto handleInteriorPayload = [&](float& tempTarget, int& humidityTarget, bool& refreshFlag) {
+  auto handleInteriorPayload = [&](float& tempTarget, int& humidityTarget, bool& refreshFlag,
+                                    unsigned long& receivedMs) {
     bool updated = false;
     JsonVariantConst tempVar = doc["temperature"];
     if (tempVar.is<float>()) {
       float newTemp = tempVar.as<float>();
+      if (!isnan(newTemp)) {
+        receivedMs = millis();
+      }
       if (!isnan(newTemp) && (isnan(tempTarget) || fabsf(newTemp - tempTarget) > 0.01f)) {
         tempTarget = newTemp;
         updated = true;
@@ -1439,6 +1430,7 @@ void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
     if (humidityVar.is<float>()) {
       float newHum = humidityVar.as<float>();
       if (!isnan(newHum)) {
+        receivedMs = millis();
         int rounded = static_cast<int>(roundf(newHum));
         rounded = constrain(rounded, 0, 100);
         if (humidityTarget < 0 || rounded != humidityTarget) {
@@ -1453,12 +1445,12 @@ void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
   };
 
   if (topicStr == TOPIC_GROUND) {
-    handleInteriorPayload(tempRDC, humidityRDC, gGroundNeedsUpdate);
+    handleInteriorPayload(tempRDC, humidityRDC, gGroundNeedsUpdate, gGroundReceivedMs);
     return;
   }
 
   if (topicStr == TOPIC_FLOOR) {
-    handleInteriorPayload(tempEtage, humidityEtage, gUpperNeedsUpdate);
+    handleInteriorPayload(tempEtage, humidityEtage, gUpperNeedsUpdate, gFloorReceivedMs);
     return;
   }
 }
@@ -1470,31 +1462,35 @@ void drawWindArrow(int centerX, int centerY, float bearingDegrees, int size) {
     return;
   }
 
-  float scale = static_cast<float>(clampedSize) / WIND_ICON_SIZE;
   // Le bearing indique d'où vient le vent. La flèche doit pointer vers où il va (+180°).
   // L'icône pointe vers le nord (0°), on la tourne dans le sens horaire.
+  // Échantillonnage inverse : chaque pixel de destination va chercher son
+  // pixel source, ce qui évite les trous d'une rotation pixel par pixel.
   float angleRad = radians(bearingDegrees + 180.0f);
   float cosA = cosf(angleRad);
   float sinA = sinf(angleRad);
-  int halfSrc = WIND_ICON_SIZE / 2;
+  float invScale = static_cast<float>(WIND_ICON_SIZE) / clampedSize;
+  float halfSrc = WIND_ICON_SIZE / 2.0f;
+  int radius = (clampedSize * 3) / 4 + 1;  // couvre la diagonale de l'icône tournée
 
-  for (int y = 0; y < WIND_ICON_SIZE; ++y) {
-    for (int x = 0; x < WIND_ICON_SIZE; ++x) {
-      size_t bitIndex = static_cast<size_t>(y) * WIND_ICON_SIZE + x;
-      size_t byteIndex = bitIndex / 8;
-      uint8_t byteValue = pgm_read_byte(epd_bitmap_wind_north + byteIndex);
+  for (int dy = -radius; dy <= radius; ++dy) {
+    for (int dx = -radius; dx <= radius; ++dx) {
+      float relX = static_cast<float>(dx) * invScale;
+      float relY = static_cast<float>(dy) * invScale;
+      // Rotation inverse (angle opposé) vers le repère de l'icône.
+      int srcX = static_cast<int>(floorf(relX * cosA + relY * sinA + halfSrc));
+      int srcY = static_cast<int>(floorf(-relX * sinA + relY * cosA + halfSrc));
+      if (srcX < 0 || srcY < 0 || srcX >= WIND_ICON_SIZE || srcY >= WIND_ICON_SIZE) {
+        continue;
+      }
+      size_t bitIndex = static_cast<size_t>(srcY) * WIND_ICON_SIZE + srcX;
+      uint8_t byteValue = pgm_read_byte(epd_bitmap_wind_north + bitIndex / 8);
       bool pixelBlack = ((byteValue >> (7 - (bitIndex % 8))) & 0x01) == 0;
       if (!pixelBlack) {
         continue;
       }
-
-      float relX = (static_cast<float>(x - halfSrc) + 0.5f) * scale;
-      float relY = (static_cast<float>(y - halfSrc) + 0.5f) * scale;
-      float rotX = relX * cosA - relY * sinA;
-      float rotY = relX * sinA + relY * cosA;
-      int dstX = centerX + static_cast<int>(roundf(rotX));
-      int dstY = centerY + static_cast<int>(roundf(rotY));
-
+      int dstX = centerX + dx;
+      int dstY = centerY + dy;
       if (dstX < 0 || dstY < 0 || dstX >= display.width() || dstY >= display.height()) {
         continue;
       }
@@ -1579,19 +1575,9 @@ bool updateForecastFromStoredData() {
     return false;
   }
 
-  time_t nowTs = time(nullptr);
-  if (nowTs <= 0) {
-    struct tm tmNow = {};
-    tmNow.tm_year = year - 1900;
-    int monthIdx = monthNumberFromName(monthName) - 1;
-    if (monthIdx < 0) monthIdx = 0;
-    tmNow.tm_mon = monthIdx;
-    tmNow.tm_mday = dayNumber;
-    tmNow.tm_hour = currentHour;
-    tmNow.tm_min = currentMinute;
-    tmNow.tm_sec = 0;
-    tmNow.tm_isdst = -1;
-    nowTs = mktime(&tmNow);
+  time_t nowTs = 0;
+  if (!currentEpoch(nowTs)) {
+    return false;
   }
 
   struct tm nowTm;
@@ -1602,26 +1588,27 @@ bool updateForecastFromStoredData() {
   STATION_LOG_PRINTF("[Forecast] nowTs=%s count=%d\n", nowBuf, gForecastCount);
 
   int targetIdx = -1;
-  if (nowTs <= 0) {
+  // Chercher le point le plus récent dont le timestamp est <= maintenant
+  for (int i = gForecastCount - 1; i >= 0; --i) {
+    if (gForecastPoints[i].ts <= nowTs) {
+      targetIdx = i;
+      break;
+    }
+  }
+  // Si tous les points sont dans le futur, prendre le premier
+  if (targetIdx == -1) {
     targetIdx = 0;
-  } else {
-    // Chercher le point le plus récent dont le timestamp est <= maintenant
-    for (int i = gForecastCount - 1; i >= 0; --i) {
-      if (gForecastPoints[i].ts <= nowTs) {
-        targetIdx = i;
-        break;
-      }
-    }
-    // Si tous les points sont dans le futur, prendre le premier
-    if (targetIdx == -1) {
-      targetIdx = 0;
-    }
   }
 
   const ForecastPoint& point = gForecastPoints[targetIdx];
   float newBearing = point.bearing;
   float newSpeed = point.speed;
   time_t newEpoch = point.ts;
+  // Prévision qui n'a plus été renouvelée : ne pas figer un vent ancien.
+  if (nowTs - point.ts > FORECAST_STALE_AFTER_S) {
+    newBearing = NAN;
+    newSpeed = NAN;
+  }
 
   struct tm pointTm;
   char timeBuf[20] = "--";
