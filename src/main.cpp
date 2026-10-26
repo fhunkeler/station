@@ -10,7 +10,6 @@
 
 #include "station_fonts.h"
 #include "moon_icons.h"
-#include "wind_icons.h"
 #include "secrets.h"
 
 // Set ENABLE_STATION_LOGS to 0 at build time to strip Serial logs in production.
@@ -124,6 +123,10 @@ constexpr size_t MAX_MONO_BITMAP_BYTES = MAX_BITMAP_PIXELS / 8;
 constexpr double SYNODIC_MONTH_DAYS = 29.530588853;
 constexpr double KNOWN_NEW_MOON_JD = 2451550.1;  // 6 janvier 2000 18:14 UTC
 constexpr double UNIX_EPOCH_JD = 2440587.5;
+
+#ifndef WIND_ARROW_STYLE
+#define WIND_ARROW_STYLE 1
+#endif
 
 #if ENABLE_STATION_LOGS
 constexpr uint32_t DISPLAY_DIAG_BAUD = 115200;
@@ -868,8 +871,10 @@ void drawTideContent() {
       }
     }
     if (prevY >= 0) {
-      display.drawLine(x - 1, prevY, x, y, GxEPD_BLACK);
-      display.drawLine(x - 1, prevY + 1, x, y + 1, GxEPD_BLACK);
+      // Trait de 3 px : les marches d'une pente faible se voient moins.
+      for (int t = -1; t <= 1; ++t) {
+        display.drawLine(x - 1, prevY + t, x, y + t, GxEPD_BLACK);
+      }
     }
     prevY = y;
   }
@@ -1607,48 +1612,39 @@ void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
   }
 }
 
+// Flèche du vent dessinée en vectoriel (nette à toute taille), centrée sur
+// (centerX, centerY) et inscrite dans un carré de côté size. Le bearing
+// indique d'où vient le vent : la flèche pointe vers où il va (+180°).
+// WIND_ARROW_STYLE : 1 = flèche à hampe (par défaut), 0 = flèche de navigation
+// à encoche.
 void drawWindArrow(int centerX, int centerY, float bearingDegrees, int size) {
-  int clampedSize = max(16, size);
-
   if (isnan(bearingDegrees)) {
     return;
   }
+  const float angle = radians(bearingDegrees + 180.0f);
+  const float cosA = cosf(angle);
+  const float sinA = sinf(angle);
+  const float half = max(12, size) / 2.0f;
+  // Coordonnées en demi-taille, flèche pointant vers le haut (y vers le bas),
+  // tournées dans le sens horaire de l'angle.
+  auto px = [&](float ux, float uy) {
+    return static_cast<int16_t>(centerX + roundf((ux * cosA - uy * sinA) * half));
+  };
+  auto py = [&](float ux, float uy) {
+    return static_cast<int16_t>(centerY + roundf((ux * sinA + uy * cosA) * half));
+  };
+  auto fillTri = [&](float ax, float ay, float bx, float by, float cx, float cy) {
+    display.fillTriangle(px(ax, ay), py(ax, ay), px(bx, by), py(bx, by), px(cx, cy), py(cx, cy), GxEPD_BLACK);
+  };
 
-  // Le bearing indique d'où vient le vent. La flèche doit pointer vers où il va (+180°).
-  // L'icône pointe vers le nord (0°), on la tourne dans le sens horaire.
-  // Échantillonnage inverse : chaque pixel de destination va chercher son
-  // pixel source, ce qui évite les trous d'une rotation pixel par pixel.
-  float angleRad = radians(bearingDegrees + 180.0f);
-  float cosA = cosf(angleRad);
-  float sinA = sinf(angleRad);
-  float invScale = static_cast<float>(WIND_ICON_SIZE) / clampedSize;
-  float halfSrc = WIND_ICON_SIZE / 2.0f;
-  int radius = (clampedSize * 3) / 4 + 1;  // couvre la diagonale de l'icône tournée
-
-  for (int dy = -radius; dy <= radius; ++dy) {
-    for (int dx = -radius; dx <= radius; ++dx) {
-      float relX = static_cast<float>(dx) * invScale;
-      float relY = static_cast<float>(dy) * invScale;
-      // Rotation inverse (angle opposé) vers le repère de l'icône.
-      int srcX = static_cast<int>(floorf(relX * cosA + relY * sinA + halfSrc));
-      int srcY = static_cast<int>(floorf(-relX * sinA + relY * cosA + halfSrc));
-      if (srcX < 0 || srcY < 0 || srcX >= WIND_ICON_SIZE || srcY >= WIND_ICON_SIZE) {
-        continue;
-      }
-      size_t bitIndex = static_cast<size_t>(srcY) * WIND_ICON_SIZE + srcX;
-      uint8_t byteValue = pgm_read_byte(epd_bitmap_wind_north + bitIndex / 8);
-      bool pixelBlack = ((byteValue >> (7 - (bitIndex % 8))) & 0x01) == 0;
-      if (!pixelBlack) {
-        continue;
-      }
-      int dstX = centerX + dx;
-      int dstY = centerY + dy;
-      if (dstX < 0 || dstY < 0 || dstX >= display.width() || dstY >= display.height()) {
-        continue;
-      }
-      display.drawPixel(dstX, dstY, GxEPD_BLACK);
-    }
-  }
+#if WIND_ARROW_STYLE == 1
+  fillTri(0.0f, -1.0f, 0.62f, -0.15f, -0.62f, -0.15f);    // pointe
+  fillTri(-0.17f, -0.2f, 0.17f, -0.2f, 0.17f, 1.0f);      // hampe
+  fillTri(-0.17f, -0.2f, 0.17f, 1.0f, -0.17f, 1.0f);
+#else
+  fillTri(0.0f, -1.0f, 0.72f, 0.95f, 0.0f, 0.42f);        // moitié droite
+  fillTri(0.0f, -1.0f, 0.0f, 0.42f, -0.72f, 0.95f);       // moitié gauche
+#endif
 }
 
 bool loadForecastFromJson(const char* payload, size_t length) {
