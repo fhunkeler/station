@@ -123,6 +123,8 @@ constexpr time_t MEASUREMENT_STALE_AFTER_S = 3 * 3600;
 constexpr time_t FORECAST_STALE_AFTER_S = 3 * 3600;
 // Rafraîchissement complet périodique contre la rémanence des mises à jour partielles.
 constexpr int FULL_REFRESH_EVERY_MINUTES = 60;
+// Nettoyage noir/blanc quotidien, à une heure où personne ne regarde.
+constexpr int GHOST_CLEANING_HOUR = 4;
 // Un horodatage antérieur à 2020 signifie que l'horloge n'a jamais été réglée.
 constexpr time_t MIN_VALID_EPOCH = 1577836800;
 constexpr const char* TOPIC_TIDE = "station/tide";
@@ -1114,6 +1116,20 @@ void updateInteriorSeparator() {
   } while (display.nextPage());
 }
 
+// Efface la rémanence profonde (restes d'images précédentes visibles en
+// transparence) : écran entièrement noir puis entièrement blanc, en mode
+// complet. Plus long et plus visible qu'un rafraîchissement normal, il n'est
+// fait qu'au démarrage et une fois par nuit.
+void clearPanelGhosts() {
+  for (uint16_t color : {GxEPD_BLACK, GxEPD_WHITE}) {
+    display.setFullWindow();
+    display.firstPage();
+    do {
+      display.fillScreen(color);
+    } while (display.nextPage());
+  }
+}
+
 // Rafraîchissement complet : efface la rémanence laissée par les mises à
 // jour partielles successives. Il se fait en deux temps, comme à l'origine :
 // passage au blanc en mode complet, puis contenu en mode partiel. Dessiné
@@ -1217,6 +1233,13 @@ void onMinuteTick() {
   updateForecastFromStoredData();
   expireStaleMeasurements();
 
+  if (gTimeValid && gNow.tm_hour == GHOST_CLEANING_HOUR && gNow.tm_min == 0) {
+    minutesSinceFullRefresh = 0;
+    clearPanelGhosts();
+    displayWeatherStation();
+    return;
+  }
+
   if (++minutesSinceFullRefresh >= FULL_REFRESH_EVERY_MINUTES) {
     minutesSinceFullRefresh = 0;
     displayWeatherStation();
@@ -1263,6 +1286,7 @@ void setup() {
   updateMoonData();
   updateTideForecastFromStoredEvents();
   updateForecastFromStoredData();
+  clearPanelGhosts();
   displayWeatherStation();
 
   STATION_LOG_PRINTLN("Affichage initial terminé");
