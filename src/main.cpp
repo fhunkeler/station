@@ -666,6 +666,23 @@ const char* compassPoint(float bearingDegrees) {
   return POINTS[index];
 }
 
+// Libellé court des conditions météo de Home Assistant (polices sans accents).
+const char* conditionLabel(const char* condition) {
+  static const char* const LABELS[][2] = {
+    {"clear-night", "Nuit claire"}, {"cloudy", "Couvert"}, {"exceptional", "Exceptionnel"},
+    {"fog", "Brouillard"}, {"hail", "Grele"}, {"lightning", "Orage"},
+    {"lightning-rainy", "Orage"}, {"partlycloudy", "Eclaircies"}, {"pouring", "Averses"},
+    {"rainy", "Pluie"}, {"snowy", "Neige"}, {"snowy-rainy", "Pluie/neige"},
+    {"sunny", "Soleil"}, {"windy", "Venteux"}, {"windy-variant", "Venteux"},
+  };
+  for (const auto& entry : LABELS) {
+    if (strcmp(condition, entry[0]) == 0) {
+      return entry[1];
+    }
+  }
+  return "--";
+}
+
 const char* const FRENCH_DAY_NAMES[7] = {
   "Dimanche", "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi"
 };
@@ -745,20 +762,9 @@ void drawTideContent() {
   display.setFont(&FreeSansBold9pt7b);
   printAligned(isTideRising ? "MAREE MONTANTE" : "MAREE DESCENDANTE", left, titleBaseline, ALIGN_LEFT);
 
-  // Le coefficient se rapporte à la pleine mer : prendre la prochaine.
-  int coef = -1;
-  for (int i = 0; i < gTideEventCount; ++i) {
-    if (gTideEvents[i].ts > nowTs && strcmp(gTideEvents[i].type, "HIGH") == 0) {
-      coef = gTideEvents[i].coeff;
-      break;
-    }
-  }
-  if (coef < 0) {
-    coef = tideCoefficient;
-  }
   char coefStr[16];
-  if (coef >= 0) {
-    snprintf(coefStr, sizeof(coefStr), "Coef %d", coef);
+  if (tideCoefficient >= 0) {
+    snprintf(coefStr, sizeof(coefStr), "Coef %d", tideCoefficient);
   } else {
     strcpy(coefStr, "Coef --");
   }
@@ -861,12 +867,6 @@ void drawBottomContent() {
   const int col2 = col1 + columnWidth;
   const int col3 = col2 + columnWidth;
 
-  char pressureStr[16];
-  if (pressureAtmospheric >= 0) {
-    snprintf(pressureStr, sizeof(pressureStr), "%d hPa", pressureAtmospheric);
-  } else {
-    strcpy(pressureStr, "-- hPa");
-  }
   char humRdcStr[16];
   char humEtageStr[16];
   if (humidityRDC >= 0) {
@@ -880,29 +880,37 @@ void drawBottomContent() {
     strcpy(humEtageStr, "-- %");
   }
 
-  drawMeasureColumn("EXTERIEUR", col1, tempExterior, pressureStr);
+  drawMeasureColumn("EXTERIEUR", col1, tempExterior, conditionLabel(weatherCondition));
   drawMeasureColumn("RDC", col2, tempRDC, humRdcStr);
   drawMeasureColumn("ETAGE", col3, tempEtage, humEtageStr);
 
-  // Vent, sous la colonne extérieure : flèche, vitesse et direction.
+  // Ligne du bas, pleine largeur : vent et rafales à gauche, pression à droite.
   display.setFont(&FreeSans9pt7b);
-  const int windBaseline = BOTTOM_AREA.y + BOTTOM_AREA.h - 6;
+  const int infoBaseline = BOTTOM_AREA.y + BOTTOM_AREA.h - 6;
+  const int arrowSize = 22;
   if (isnan(windSpeedKmh) || isnan(windBearingDegrees)) {
-    printAligned("Vent --", col1, windBaseline, ALIGN_CENTER);
+    printAligned("Vent --", SCREEN_MARGIN, infoBaseline, ALIGN_LEFT);
   } else {
-    char windStr[20];
-    snprintf(windStr, sizeof(windStr), "%.0f km/h %s", windSpeedKmh, compassPoint(windBearingDegrees));
-    int16_t bx, by;
-    uint16_t bw, bh;
-    display.getTextBounds(windStr, 0, 0, &bx, &by, &bw, &bh);
-    const int arrowSize = 22;
-    const int blockLeft = col1 - (arrowSize + 4 + static_cast<int>(bw)) / 2;
-    drawWindArrow(blockLeft + arrowSize / 2, windBaseline - 5, windBearingDegrees, arrowSize);
-    printAligned(windStr, blockLeft + arrowSize + 4, windBaseline, ALIGN_LEFT);
+    char windStr[40];
+    if (isnan(windGustKmh)) {
+      snprintf(windStr, sizeof(windStr), "%.0f km/h %s", windSpeedKmh, compassPoint(windBearingDegrees));
+    } else {
+      snprintf(windStr, sizeof(windStr), "%.0f km/h %s, rafales %.0f", windSpeedKmh,
+               compassPoint(windBearingDegrees), windGustKmh);
+    }
+    drawWindArrow(SCREEN_MARGIN + arrowSize / 2, infoBaseline - 5, windBearingDegrees, arrowSize);
+    printAligned(windStr, SCREEN_MARGIN + arrowSize + 6, infoBaseline, ALIGN_LEFT);
   }
+  char pressureStr[16];
+  if (pressureAtmospheric >= 0) {
+    snprintf(pressureStr, sizeof(pressureStr), "%d hPa", pressureAtmospheric);
+  } else {
+    strcpy(pressureStr, "-- hPa");
+  }
+  printAligned(pressureStr, width - SCREEN_MARGIN, infoBaseline, ALIGN_RIGHT);
 
   display.fillRect(SCREEN_MARGIN, BOTTOM_AREA.y, width - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
-  // Les séparateurs s'arrêtent au-dessus de la ligne du vent, plus large que sa colonne.
+  // Les séparateurs s'arrêtent au-dessus de la ligne du bas.
   const int separatorTop = BOTTOM_AREA.y + 10;
   const int separatorHeight = 82;
   display.drawFastVLine(SCREEN_MARGIN + columnWidth, separatorTop, separatorHeight, GxEPD_BLACK);
