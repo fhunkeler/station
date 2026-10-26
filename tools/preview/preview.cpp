@@ -96,6 +96,10 @@ int main(int argc, char** argv) {
   tzset();
   const time_t now = time(nullptr);
   loadStationConfig();
+  // Valeurs fictives : les images de docs/ ne doivent rien révéler du
+  // secrets.h local.
+  strcpy(gConfig.wifiSsid, "MaBox");
+  strcpy(gConfig.mqttHost, "192.168.1.10");
   updateDateTimeFromClock();
   display.init(0);
   display.setRotation(0);
@@ -106,13 +110,13 @@ int main(int argc, char** argv) {
     gConfigReason = ConfigReason::WIFI_UNREACHABLE;
     showFullScreen(drawConfigScreenContent);
   } else if (mode == "splash") {
-    gBootSteps[BOOT_STEP_WIFI] = {"WiFi", STEP_DONE, "192.168.0.161"};
-    gBootSteps[BOOT_STEP_MQTT] = {"Serveur MQTT", STEP_DONE, "192.168.0.248"};
+    gBootSteps[BOOT_STEP_WIFI] = {"WiFi", STEP_DONE, "192.168.1.42"};
+    gBootSteps[BOOT_STEP_MQTT] = {"Serveur MQTT", STEP_DONE, "192.168.1.10"};
     gBootSteps[BOOT_STEP_TIME] = {"Heure (NTP)", STEP_RUNNING, ""};
     gBootSteps[BOOT_STEP_DATA] = {"Données", STEP_RUNNING, "3/5 sources"};
     updateSplashScreen();
   } else if (mode == "splashfail") {
-    gBootSteps[BOOT_STEP_WIFI] = {"WiFi", STEP_DONE, "192.168.0.161"};
+    gBootSteps[BOOT_STEP_WIFI] = {"WiFi", STEP_DONE, "192.168.1.42"};
     gBootSteps[BOOT_STEP_MQTT] = {"Serveur MQTT", STEP_FAILED, ""};
     gBootSteps[BOOT_STEP_TIME] = {"Heure (NTP)", STEP_DONE, "20:42"};
     gBootSteps[BOOT_STEP_DATA] = {"Données", STEP_FAILED, ""};

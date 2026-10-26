@@ -6,7 +6,7 @@
 #define WIFI_PS_NONE 0
 #define WIFI_PS_MAX_MODEM 2
 struct WiFiStub {
-  struct Ip { String toString() const { return String("192.168.0.161"); } };
+  struct Ip { String toString() const { return String("192.168.1.42"); } };
   int status() { return 0; }
   void mode(int) {}
   void setAutoReconnect(bool) {}
