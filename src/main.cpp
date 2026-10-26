@@ -7,13 +7,8 @@
 #include <math.h>
 #include <stdlib.h>
 #include <ctype.h>
-#include <Fonts/FreeSans9pt7b.h>
-#include <Fonts/FreeSans12pt7b.h>
-#include <Fonts/FreeSansBold9pt7b.h>
-#include <Fonts/FreeSansBold12pt7b.h>
-#include <Fonts/FreeSansBold24pt7b.h>
-#include <Fonts/FreeSansBold18pt7b.h>
 
+#include "station_fonts.h"
 #include "moon_icons.h"
 #include "wind_icons.h"
 #include "secrets.h"
@@ -171,9 +166,9 @@ struct Rect {
 // concerne que x et w (toujours 0 et 400 ici).
 constexpr int16_t SCREEN_MARGIN = 12;
 constexpr Rect HEADER_AREA = {0, 0, 400, 64};
-constexpr Rect TIDE_AREA = {0, 64, 400, 68};
-constexpr Rect WIND_AREA = {0, 132, 400, 72};
-constexpr Rect BOTTOM_AREA = {0, 204, 400, 96};
+constexpr Rect TIDE_AREA = {0, 64, 400, 64};
+constexpr Rect WIND_AREA = {0, 128, 400, 68};
+constexpr Rect BOTTOM_AREA = {0, 196, 400, 104};
 
 // Le repère "maintenant" sur l'arc de marée avance toutes les 10 minutes.
 constexpr int TIDE_CHART_REFRESH_MINUTES = 10;
@@ -590,9 +585,48 @@ void drawMoonPhase(int centerX, int centerY, int phase) {
   drawBitmapBlackOnWhite(topLeftX, topLeftY, bitmap, MOON_ICON_SIZE, MOON_ICON_SIZE);
 }
 
+const GFXfont* gCurrentFont = nullptr;
+
+void useFont(const GFXfont* font) {
+  gCurrentFont = font;
+  display.setFont(font);
+}
+
+// Les sources sont en UTF-8, les polices GFX indexent des octets : convertit
+// en Latin-1 si la police courante couvre ces caractères, sinon remplace les
+// lettres accentuées par leur équivalent sans accent.
+void toFontEncoding(const char* utf8, char* out, size_t outSize) {
+  static const char ASCII_FOR_LATIN1[] = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYPsaaaaaaaceeeeiiiidnooooo/ouuuuypy";
+  const uint8_t lastGlyph = gCurrentFont != nullptr ? pgm_read_byte(&gCurrentFont->last) : 0x7E;
+  size_t n = 0;
+  for (const uint8_t* p = reinterpret_cast<const uint8_t*>(utf8); *p != 0 && n + 1 < outSize; ++p) {
+    uint16_t code = *p;
+    if ((code & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+      code = static_cast<uint16_t>(((code & 0x1F) << 6) | (p[1] & 0x3F));
+      ++p;
+    } else if (code >= 0x80) {
+      code = '?';  // séquence plus longue ou invalide : hors Latin-1
+      while ((p[1] & 0xC0) == 0x80) {
+        ++p;
+      }
+    }
+    if (code > lastGlyph) {
+      code = (code >= 0xC0 && code <= 0xFF) ? ASCII_FOR_LATIN1[code - 0xC0] : '?';
+    }
+    out[n++] = static_cast<char>(code);
+  }
+  out[n] = '\0';
+}
+
+bool currentFontHasLatin1() {
+  return gCurrentFont != nullptr && pgm_read_byte(&gCurrentFont->last) >= 0xFF;
+}
+
 // Écrit text avec la police courante, aligné horizontalement sur x.
 // Renvoie l'abscisse du bord droit du texte.
-int printAligned(const char* text, int x, int baseline, TextAlign align) {
+int printAligned(const char* utf8, int x, int baseline, TextAlign align) {
+  char text[48];
+  toFontEncoding(utf8, text, sizeof(text));
   int16_t bx, by;
   uint16_t bw, bh;
   display.getTextBounds(text, 0, 0, &bx, &by, &bw, &bh);
@@ -609,7 +643,9 @@ int printAligned(const char* text, int x, int baseline, TextAlign align) {
 
 // Comme printAligned, mais sur un fond blanc pour rester lisible par-dessus
 // la courbe de marée. Le texte est contenu dans [minX, maxX].
-void printLabel(const char* text, int x, int baseline, TextAlign align, int minX, int maxX) {
+void printLabel(const char* utf8, int x, int baseline, TextAlign align, int minX, int maxX) {
+  char text[48];
+  toFontEncoding(utf8, text, sizeof(text));
   int16_t bx, by;
   uint16_t bw, bh;
   display.getTextBounds(text, 0, 0, &bx, &by, &bw, &bh);
@@ -626,19 +662,25 @@ void printLabel(const char* text, int x, int baseline, TextAlign align, int minX
 }
 
 // Température en gros avec un signe degré dessiné (les polices GFX n'ont
-// pas de "°"). "--.-" si la valeur est inconnue.
+// pas de "°"). "--" si la valeur est inconnue.
 void drawTemperature(float value, int x, int baseline, TextAlign align, const GFXfont* font, int degreeRadius) {
-  char text[8];
+  char text[12];
   if (isnan(value)) {
-    strcpy(text, "--.-");
+    strcpy(text, "--");
   } else {
     snprintf(text, sizeof(text), "%.1f", value);
   }
-  display.setFont(font);
+  useFont(font);
+  // Une police Latin-1 a son propre signe degré, plus net qu'un cercle dessiné.
+  const bool showDegree = !isnan(value);
+  const bool fontHasDegree = currentFontHasLatin1();
+  if (showDegree && fontHasDegree) {
+    strcat(text, "\xB0");
+  }
   int16_t bx, by;
   uint16_t bw, bh;
   display.getTextBounds(text, 0, 0, &bx, &by, &bw, &bh);
-  const int degreeWidth = 2 * degreeRadius + 3;
+  const int degreeWidth = (showDegree && !fontHasDegree) ? 2 * degreeRadius + 3 : 0;
   const int totalWidth = static_cast<int>(bw) + degreeWidth;
   int left = x;
   if (align == ALIGN_CENTER) {
@@ -648,10 +690,12 @@ void drawTemperature(float value, int x, int baseline, TextAlign align, const GF
   }
   display.setCursor(left - bx, baseline);
   display.print(text);
-  const int cx = left + bw + 3 + degreeRadius;
-  const int cy = baseline + by + degreeRadius;
-  display.drawCircle(cx, cy, degreeRadius, GxEPD_BLACK);
-  display.drawCircle(cx, cy, degreeRadius - 1, GxEPD_BLACK);
+  if (showDegree && !fontHasDegree) {
+    const int cx = left + bw + 3 + degreeRadius;
+    const int cy = baseline + by + degreeRadius;
+    display.drawCircle(cx, cy, degreeRadius, GxEPD_BLACK);
+    display.drawCircle(cx, cy, degreeRadius - 1, GxEPD_BLACK);
+  }
 }
 
 const char* compassPoint(float bearingDegrees) {
@@ -666,12 +710,12 @@ const char* compassPoint(float bearingDegrees) {
   return POINTS[index];
 }
 
-// Libellé court des conditions météo de Home Assistant (polices sans accents).
+// Libellé court des conditions météo de Home Assistant.
 const char* conditionLabel(const char* condition) {
   static const char* const LABELS[][2] = {
     {"clear-night", "Nuit claire"}, {"cloudy", "Couvert"}, {"exceptional", "Exceptionnel"},
-    {"fog", "Brouillard"}, {"hail", "Grele"}, {"lightning", "Orage"},
-    {"lightning-rainy", "Orage"}, {"partlycloudy", "Eclaircies"}, {"pouring", "Averses"},
+    {"fog", "Brouillard"}, {"hail", "Grêle"}, {"lightning", "Orage"},
+    {"lightning-rainy", "Orage"}, {"partlycloudy", "Éclaircies"}, {"pouring", "Averses"},
     {"rainy", "Pluie"}, {"snowy", "Neige"}, {"snowy-rainy", "Pluie/neige"},
     {"sunny", "Soleil"}, {"windy", "Venteux"}, {"windy-variant", "Venteux"},
   };
@@ -688,8 +732,8 @@ const char* const FRENCH_DAY_NAMES[7] = {
 };
 
 const char* const FRENCH_MONTH_NAMES[12] = {
-  "janvier", "fevrier", "mars", "avril", "mai", "juin",
-  "juillet", "aout", "septembre", "octobre", "novembre", "decembre"
+  "janvier", "février", "mars", "avril", "mai", "juin",
+  "juillet", "août", "septembre", "octobre", "novembre", "décembre"
 };
 
 void drawHeaderContent() {
@@ -699,16 +743,21 @@ void drawHeaderContent() {
   if (gTimeValid) {
     snprintf(timeStr, sizeof(timeStr), "%02d:%02d", gNow.tm_hour, gNow.tm_min);
   }
-  display.setFont(&FreeSansBold24pt7b);
-  const int timeRight = printAligned(timeStr, SCREEN_MARGIN, 47, ALIGN_LEFT);
+  // Heure centrée verticalement au-dessus du filet, quelle que soit la police.
+  useFont(FONT_CLOCK);
+  int16_t clockX, clockY;
+  uint16_t clockW, clockH;
+  display.getTextBounds("00:00", 0, 0, &clockX, &clockY, &clockW, &clockH);
+  const int clockBaseline = (HEADER_AREA.h - 4 - static_cast<int>(clockH)) / 2 - clockY;
+  const int timeRight = printAligned(timeStr, SCREEN_MARGIN, clockBaseline, ALIGN_LEFT);
 
   if (gTimeValid) {
     char dateStr[24];
     snprintf(dateStr, sizeof(dateStr), "%d %s", gNow.tm_mday, FRENCH_MONTH_NAMES[gNow.tm_mon % 12]);
     const int dateX = timeRight + 14;
-    display.setFont(&FreeSansBold12pt7b);
+    useFont(FONT_MEDIUM_BOLD);
     printAligned(FRENCH_DAY_NAMES[gNow.tm_wday % 7], dateX, 26, ALIGN_LEFT);
-    display.setFont(&FreeSans12pt7b);
+    useFont(FONT_MEDIUM);
     printAligned(dateStr, dateX, 48, ALIGN_LEFT);
   }
 
@@ -718,7 +767,7 @@ void drawHeaderContent() {
     drawMoonPhase(moonCenterX, moonCenterY, moonPhase);
     char moonText[16];
     snprintf(moonText, sizeof(moonText), "%d%%", moonIllumination);
-    display.setFont(&FreeSans9pt7b);
+    useFont(FONT_SMALL);
     printAligned(moonText, moonCenterX - MOON_ICON_SIZE / 2 - 6, moonCenterY + 6, ALIGN_RIGHT);
   }
 
@@ -749,10 +798,10 @@ void drawTideExtremum(const TideEvent& event, int x, TextAlign align) {
   } else {
     snprintf(detail, sizeof(detail), "%s %.1f m", kind, event.height);
   }
-  display.setFont(&FreeSansBold12pt7b);
-  printAligned(timeStr, x, TIDE_AREA.y + 42, align);
-  display.setFont(&FreeSans9pt7b);
-  printAligned(detail, x, TIDE_AREA.y + 61, align);
+  useFont(FONT_MEDIUM_BOLD);
+  printAligned(timeStr, x, TIDE_AREA.y + 40, align);
+  useFont(FONT_SMALL);
+  printAligned(detail, x, TIDE_AREA.y + 58, align);
 }
 
 // Marée réduite à la demi-oscillation en cours : étale précédente à gauche,
@@ -768,15 +817,15 @@ void drawTideContent() {
   const int nextIdx = findTideEventIndex(nextTideEpoch);
   const int prevIdx = findTideEventIndex(prevTideEpoch);
   if (!currentEpoch(nowTs) || nextTideEpoch == 0 || nextIdx < 0) {
-    display.setFont(&FreeSansBold9pt7b);
-    printAligned("MAREE", left, titleBaseline, ALIGN_LEFT);
-    display.setFont(&FreeSans9pt7b);
-    printAligned("Donnees indisponibles", display.width() / 2, TIDE_AREA.y + 46, ALIGN_CENTER);
+    useFont(FONT_SMALL_BOLD);
+    printAligned("MARÉE", left, titleBaseline, ALIGN_LEFT);
+    useFont(FONT_SMALL);
+    printAligned("Données indisponibles", display.width() / 2, TIDE_AREA.y + 46, ALIGN_CENTER);
     return;
   }
 
-  display.setFont(&FreeSansBold9pt7b);
-  printAligned(isTideRising ? "MAREE MONTANTE" : "MAREE DESCENDANTE", left, titleBaseline, ALIGN_LEFT);
+  useFont(FONT_SMALL_BOLD);
+  printAligned(isTideRising ? "MARÉE MONTANTE" : "MARÉE DESCENDANTE", left, titleBaseline, ALIGN_LEFT);
   char coefStr[16];
   if (tideCoefficient >= 0) {
     snprintf(coefStr, sizeof(coefStr), "Coef %d", tideCoefficient);
@@ -796,8 +845,8 @@ void drawTideContent() {
   // Arc entre les deux étales (règle du cosinus), trame sous la courbe.
   const int arcLeft = left + 86;
   const int arcRight = right - 86;
-  const int arcTop = TIDE_AREA.y + 26;
-  const int arcBottom = TIDE_AREA.y + 60;
+  const int arcTop = TIDE_AREA.y + 24;
+  const int arcBottom = TIDE_AREA.y + 55;
   const bool rising = !isnan(prev.height) && !isnan(next.height) ? next.height > prev.height : isTideRising;
   auto arcY = [&](float progress) {
     const float level = (1.0f - cosf(PI * progress)) / 2.0f;  // 0 au départ, 1 à l'arrivée
@@ -849,24 +898,24 @@ void drawWindContent() {
   const int splitX = 200;
   const int arrowSize = 46;
   const int arrowCenterX = SCREEN_MARGIN + arrowSize / 2 + 2;
-  const int arrowCenterY = y0 + 38;
+  const int arrowCenterY = y0 + 36;
   const int textX = SCREEN_MARGIN + arrowSize + 12;
 
   if (isnan(windSpeedKmh) || isnan(windBearingDegrees)) {
-    display.setFont(&FreeSansBold9pt7b);
+    useFont(FONT_SMALL_BOLD);
     printAligned("VENT", SCREEN_MARGIN, y0 + 24, ALIGN_LEFT);
-    display.setFont(&FreeSans12pt7b);
+    useFont(FONT_MEDIUM);
     printAligned("--", SCREEN_MARGIN, y0 + 52, ALIGN_LEFT);
   } else {
     drawWindArrow(arrowCenterX, arrowCenterY, windBearingDegrees, arrowSize);
     char speedStr[8];
     snprintf(speedStr, sizeof(speedStr), "%.0f", windSpeedKmh);
-    display.setFont(&FreeSansBold24pt7b);
-    const int speedRight = printAligned(speedStr, textX, y0 + 44, ALIGN_LEFT);
-    display.setFont(&FreeSans9pt7b);
-    printAligned("km/h", speedRight + 5, y0 + 44, ALIGN_LEFT);
-    display.setFont(&FreeSansBold9pt7b);
-    printAligned(compassPoint(windBearingDegrees), speedRight + 5, y0 + 24, ALIGN_LEFT);
+    useFont(FONT_LARGE);
+    const int speedRight = printAligned(speedStr, textX, y0 + 41, ALIGN_LEFT);
+    useFont(FONT_SMALL);
+    printAligned("km/h", speedRight + 5, y0 + 41, ALIGN_LEFT);
+    useFont(FONT_SMALL_BOLD);
+    printAligned(compassPoint(windBearingDegrees), speedRight + 5, y0 + 21, ALIGN_LEFT);
 
     char gustStr[24];
     if (isnan(windGustKmh)) {
@@ -874,11 +923,11 @@ void drawWindContent() {
     } else {
       snprintf(gustStr, sizeof(gustStr), "Rafales %.0f", windGustKmh);
     }
-    display.setFont(&FreeSans9pt7b);
-    printAligned(gustStr, textX, y0 + 65, ALIGN_LEFT);
+    useFont(FONT_SMALL);
+    printAligned(gustStr, textX, y0 + 61, ALIGN_LEFT);
   }
 
-  display.drawFastVLine(splitX, y0 + 10, WIND_AREA.h - 18, GxEPD_BLACK);
+  display.drawFastVLine(splitX, y0 + 8, WIND_AREA.h - 16, GxEPD_BLACK);
 
   // Tendance : flèche et vitesse moyenne toutes les 3 heures.
   time_t nowTs = 0;
@@ -900,26 +949,42 @@ void drawWindContent() {
         snprintf(slotSpeed, sizeof(slotSpeed), "%.0f", point->speed);
       }
       if (!isnan(point->bearing)) {
-        drawWindArrow(cx, y0 + 39, point->bearing, 26);
+        drawWindArrow(cx, y0 + 35, point->bearing, 22);
       }
     }
-    display.setFont(&FreeSans9pt7b);
-    printAligned(hourStr, cx, y0 + 21, ALIGN_CENTER);
-    display.setFont(&FreeSansBold9pt7b);
-    printAligned(slotSpeed, cx, y0 + 66, ALIGN_CENTER);
+    useFont(FONT_SMALL);
+    printAligned(hourStr, cx, y0 + 18, ALIGN_CENTER);
+    useFont(FONT_SMALL_BOLD);
+    printAligned(slotSpeed, cx, y0 + 64, ALIGN_CENTER);
   }
 }
 
-// Une colonne de mesure : titre, grande température, une ou deux lignes de détail.
+// Hauteur au-dessus de la ligne de base de sample dans la police font.
+int fontAscent(const GFXfont* font, const char* sample) {
+  useFont(font);
+  int16_t bx, by;
+  uint16_t bw, bh;
+  display.getTextBounds(sample, 0, 0, &bx, &by, &bw, &bh);
+  return -by;
+}
+
+// Une colonne de mesure : titre, grande température, une ou deux lignes de
+// détail. Les lignes s'empilent d'après les métriques des polices, pour que
+// la mise en page tienne quel que soit le thème typographique.
 void drawMeasureColumn(const char* title, int centerX, float temperature, const char* detail, const char* detail2) {
-  display.setFont(&FreeSansBold9pt7b);
-  printAligned(title, centerX, BOTTOM_AREA.y + 19, ALIGN_CENTER);
-  drawTemperature(temperature, centerX, BOTTOM_AREA.y + 56, ALIGN_CENTER, &FreeSansBold24pt7b, 4);
-  display.setFont(&FreeSans12pt7b);
-  printAligned(detail, centerX, BOTTOM_AREA.y + 78, ALIGN_CENTER);
+  const int titleBaseline = BOTTOM_AREA.y + 19;
+  const int temperatureBaseline = titleBaseline + 5 + fontAscent(FONT_LARGE, "0");
+  const int detailBaseline = temperatureBaseline + 4 + fontAscent(FONT_MEDIUM, "C");
+  const int detail2Baseline = detailBaseline + 3 + fontAscent(FONT_SMALL, "0");
+
+  useFont(FONT_SMALL_BOLD);
+  printAligned(title, centerX, titleBaseline, ALIGN_CENTER);
+  drawTemperature(temperature, centerX, temperatureBaseline, ALIGN_CENTER, FONT_LARGE, 4);
+  useFont(FONT_MEDIUM);
+  printAligned(detail, centerX, detailBaseline, ALIGN_CENTER);
   if (detail2 != nullptr) {
-    display.setFont(&FreeSans9pt7b);
-    printAligned(detail2, centerX, BOTTOM_AREA.y + 94, ALIGN_CENTER);
+    useFont(FONT_SMALL);
+    printAligned(detail2, centerX, detail2Baseline, ALIGN_CENTER);
   }
 }
 
@@ -950,9 +1015,9 @@ void drawBottomContent() {
     strcpy(pressureStr, "-- hPa");
   }
 
-  drawMeasureColumn("EXTERIEUR", col1, tempExterior, conditionLabel(weatherCondition), pressureStr);
+  drawMeasureColumn("EXTÉRIEUR", col1, tempExterior, conditionLabel(weatherCondition), pressureStr);
   drawMeasureColumn("RDC", col2, tempRDC, humRdcStr, nullptr);
-  drawMeasureColumn("ETAGE", col3, tempEtage, humEtageStr, nullptr);
+  drawMeasureColumn("ÉTAGE", col3, tempEtage, humEtageStr, nullptr);
 
   display.fillRect(SCREEN_MARGIN, BOTTOM_AREA.y, width - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
   const int separatorTop = BOTTOM_AREA.y + 10;
