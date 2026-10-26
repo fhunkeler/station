@@ -108,6 +108,8 @@ constexpr time_t MEASUREMENT_STALE_AFTER_S = 3 * 3600;
 constexpr time_t FORECAST_STALE_AFTER_S = 3 * 3600;
 // Rafraîchissement complet périodique contre la rémanence des mises à jour partielles.
 constexpr int FULL_REFRESH_EVERY_MINUTES = 60;
+// Nettoyage noir/blanc quotidien, à une heure où personne ne regarde.
+constexpr int GHOST_CLEANING_HOUR = 4;
 // Un horodatage antérieur à 2020 signifie que l'horloge n'a jamais été réglée.
 constexpr time_t MIN_VALID_EPOCH = 1577836800;
 constexpr const char* TOPIC_TIDE = "station/tide";
@@ -1051,10 +1053,33 @@ void updateBottomSection() {
   refreshArea(BOTTOM_AREA, drawBottomContent);
 }
 
-// Rafraîchissement complet en une seule passe : efface la rémanence laissée
-// par les mises à jour partielles successives.
+// Efface la rémanence profonde (restes d'images précédentes visibles en
+// transparence) : écran entièrement noir puis entièrement blanc, en mode
+// complet. Plus long et plus visible qu'un rafraîchissement normal, il n'est
+// fait qu'au démarrage et une fois par nuit.
+void clearPanelGhosts() {
+  for (uint16_t color : {GxEPD_BLACK, GxEPD_WHITE}) {
+    display.setFullWindow();
+    display.firstPage();
+    do {
+      display.fillScreen(color);
+    } while (display.nextPage());
+  }
+}
+
+// Rafraîchissement complet : efface la rémanence laissée par les mises à
+// jour partielles successives. Il se fait en deux temps, comme à l'origine :
+// passage au blanc en mode complet, puis contenu en mode partiel. Dessiné
+// directement par le mode complet rapide du 4,2", le contenu laisse un fond
+// grisâtre.
 void displayWeatherStation() {
   display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+  } while (display.nextPage());
+
+  display.setPartialWindow(0, 0, display.width(), display.height());
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
@@ -1063,7 +1088,6 @@ void displayWeatherStation() {
     drawWindContent();
     drawBottomContent();
   } while (display.nextPage());
-  display.powerOff();
 
   gExteriorNeedsUpdate = false;
   gTideNeedsUpdate = false;
@@ -1075,25 +1099,18 @@ void displayWeatherStation() {
 // consomme les drapeaux gXxxNeedsUpdate. gExteriorNeedsUpdate couvre aussi
 // la prévision : elle alimente la bande vent et la condition météo.
 void refreshDirtySections() {
-  bool refreshed = false;
   if (gTideNeedsUpdate) {
     gTideNeedsUpdate = false;
     updateTideSection();
-    refreshed = true;
   }
   if (gExteriorNeedsUpdate) {
     updateWindSection();
-    refreshed = true;
   }
   if (gExteriorNeedsUpdate || gGroundNeedsUpdate || gUpperNeedsUpdate) {
     gExteriorNeedsUpdate = false;
     gGroundNeedsUpdate = false;
     gUpperNeedsUpdate = false;
     updateBottomSection();
-    refreshed = true;
-  }
-  if (refreshed) {
-    display.powerOff();
   }
 }
 
@@ -1155,6 +1172,13 @@ void onMinuteTick() {
     gTideNeedsUpdate = true;  // fait glisser la courbe et le repère "maintenant"
   }
 
+  if (gTimeValid && gNow.tm_hour == GHOST_CLEANING_HOUR && gNow.tm_min == 0) {
+    minutesSinceFullRefresh = 0;
+    clearPanelGhosts();
+    displayWeatherStation();
+    return;
+  }
+
   if (++minutesSinceFullRefresh >= FULL_REFRESH_EVERY_MINUTES) {
     minutesSinceFullRefresh = 0;
     displayWeatherStation();
@@ -1162,7 +1186,6 @@ void onMinuteTick() {
   }
   updateHeaderSection();
   refreshDirtySections();
-  display.powerOff();
 }
 
 void setup() {
@@ -1201,6 +1224,7 @@ void setup() {
   updateMoonData();
   updateTideForecastFromStoredEvents();
   updateForecastFromStoredData();
+  clearPanelGhosts();
   displayWeatherStation();
 
   STATION_LOG_PRINTLN("Affichage initial terminé");
