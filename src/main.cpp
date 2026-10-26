@@ -182,6 +182,27 @@ bool gGroundNeedsUpdate = false;
 bool gUpperNeedsUpdate = false;
 bool gTideNeedsUpdate = false;
 
+// Sujets MQTT déjà reçus depuis le démarrage (un bit par sujet), pour
+// l'écran de démarrage.
+const char* const STATION_TOPICS[] = {TOPIC_TIDE, TOPIC_OUTDOOR, TOPIC_GROUND, TOPIC_FLOOR, TOPIC_FORECAST};
+constexpr int STATION_TOPIC_COUNT = sizeof(STATION_TOPICS) / sizeof(STATION_TOPICS[0]);
+uint8_t gReceivedTopicsMask = 0;
+
+// Étapes affichées par l'écran de démarrage.
+enum BootStepState : uint8_t { STEP_PENDING, STEP_RUNNING, STEP_DONE, STEP_FAILED };
+struct BootStep {
+  const char* label;
+  BootStepState state;
+  char detail[24];
+};
+enum { BOOT_STEP_WIFI, BOOT_STEP_MQTT, BOOT_STEP_TIME, BOOT_STEP_DATA, BOOT_STEP_COUNT };
+BootStep gBootSteps[BOOT_STEP_COUNT] = {
+  {"WiFi", STEP_PENDING, ""},
+  {"Serveur MQTT", STEP_PENDING, ""},
+  {"Heure (NTP)", STEP_PENDING, ""},
+  {"Données", STEP_PENDING, ""},
+};
+
 // ========== FONCTIONS D'AFFICHAGE ==========
 
 enum TextAlign { ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT };
@@ -1053,6 +1074,122 @@ void updateBottomSection() {
   refreshArea(BOTTOM_AREA, drawBottomContent);
 }
 
+// Pastille d'état d'une étape : cercle vide (en attente), cercle et point
+// (en cours), disque coché (terminée), disque barré (échec).
+void drawBootStepMarker(int cx, int cy, BootStepState state) {
+  const int r = 8;
+  switch (state) {
+    case STEP_PENDING:
+      display.drawCircle(cx, cy, r, GxEPD_BLACK);
+      break;
+    case STEP_RUNNING:
+      display.drawCircle(cx, cy, r, GxEPD_BLACK);
+      display.drawCircle(cx, cy, r - 1, GxEPD_BLACK);
+      display.fillCircle(cx, cy, 3, GxEPD_BLACK);
+      break;
+    case STEP_DONE:
+      display.fillCircle(cx, cy, r, GxEPD_BLACK);
+      for (int t = 0; t < 2; ++t) {
+        display.drawLine(cx - 4, cy + t, cx - 1, cy + 3 + t, GxEPD_WHITE);
+        display.drawLine(cx - 1, cy + 3 + t, cx + 4, cy - 3 + t, GxEPD_WHITE);
+      }
+      break;
+    case STEP_FAILED:
+      display.fillCircle(cx, cy, r, GxEPD_BLACK);
+      for (int t = 0; t < 2; ++t) {
+        display.drawLine(cx - 3 + t, cy - 3, cx + 3 + t, cy + 3, GxEPD_WHITE);
+        display.drawLine(cx + 3 + t, cy - 3, cx - 3 + t, cy + 3, GxEPD_WHITE);
+      }
+      break;
+  }
+}
+
+void drawSplashContent() {
+  display.setTextColor(GxEPD_BLACK);
+  const int width = display.width();
+  const int centerX = width / 2;
+
+  useFont(FONT_LARGE);
+  printAligned("Station météo", centerX, 62, ALIGN_CENTER);
+  bool anyFailed = false;
+  for (const BootStep& step : gBootSteps) {
+    anyFailed |= step.state == STEP_FAILED;
+  }
+  useFont(FONT_MEDIUM);
+  printAligned(anyFailed ? "Démarrage incomplet" : "Démarrage en cours", centerX, 94, ALIGN_CENTER);
+  display.fillRect(width / 10, 112, (width * 8) / 10, 2, GxEPD_BLACK);
+
+  const int markerX = 70;
+  const int labelX = markerX + 18;
+  const int detailRight = width - 60;
+  for (int i = 0; i < BOOT_STEP_COUNT; ++i) {
+    const BootStep& step = gBootSteps[i];
+    const int baseline = 150 + i * 32;
+    drawBootStepMarker(markerX, baseline - 7, step.state);
+    useFont(step.state == STEP_RUNNING ? FONT_MEDIUM_BOLD : FONT_MEDIUM);
+    printAligned(step.label, labelX, baseline, ALIGN_LEFT);
+    const char* detail = step.detail;
+    if (detail[0] == '\0') {
+      detail = step.state == STEP_RUNNING ? "en cours..." : (step.state == STEP_FAILED ? "échec" : "");
+    }
+    useFont(FONT_SMALL);
+    printAligned(detail, detailRight, baseline, ALIGN_RIGHT);
+  }
+
+  // __DATE__ vaut "Oct 26 2026" : le remettre en français.
+  static const char* const BUILD_MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char* monthPos = strstr(BUILD_MONTHS, String(__DATE__).substring(0, 3).c_str());
+  const int buildMonth = monthPos != nullptr ? static_cast<int>(monthPos - BUILD_MONTHS) / 3 : 0;
+  char buildStr[40];
+  snprintf(buildStr, sizeof(buildStr), "Firmware du %d %s %s", atoi(__DATE__ + 4),
+           FRENCH_MONTH_NAMES[buildMonth], __DATE__ + 7);
+  useFont(FONT_SMALL);
+  printAligned(buildStr, centerX, display.height() - 8, ALIGN_CENTER);
+}
+
+void updateSplashScreen() {
+  refreshArea(Rect{0, 0, static_cast<int16_t>(display.width()), static_cast<int16_t>(display.height())},
+              drawSplashContent);
+}
+
+// Met à jour gBootSteps d'après l'état du réseau. Renvoie vrai si l'écran de
+// démarrage doit être redessiné.
+bool refreshBootSteps() {
+  BootStep previous[BOOT_STEP_COUNT];
+  memcpy(previous, gBootSteps, sizeof(previous));
+
+  const bool wifiUp = WiFi.status() == WL_CONNECTED;
+  const bool mqttUp = gMqttClient.connected();
+  int received = 0;
+  for (int i = 0; i < STATION_TOPIC_COUNT; ++i) {
+    received += (gReceivedTopicsMask >> i) & 1U;
+  }
+
+  BootStep& wifi = gBootSteps[BOOT_STEP_WIFI];
+  wifi.state = wifiUp ? STEP_DONE : STEP_RUNNING;
+  if (wifiUp) {
+    snprintf(wifi.detail, sizeof(wifi.detail), "%s", WiFi.localIP().toString().c_str());
+  }
+
+  BootStep& mqtt = gBootSteps[BOOT_STEP_MQTT];
+  mqtt.state = mqttUp ? STEP_DONE : (wifiUp ? STEP_RUNNING : STEP_PENDING);
+  snprintf(mqtt.detail, sizeof(mqtt.detail), "%s", mqttUp ? MQTT_HOST : "");
+
+  BootStep& clock = gBootSteps[BOOT_STEP_TIME];
+  clock.state = gTimeValid ? STEP_DONE : (wifiUp ? STEP_RUNNING : STEP_PENDING);
+  if (gTimeValid) {
+    snprintf(clock.detail, sizeof(clock.detail), "%02d:%02d", gNow.tm_hour, gNow.tm_min);
+  }
+
+  BootStep& data = gBootSteps[BOOT_STEP_DATA];
+  data.state = received == STATION_TOPIC_COUNT ? STEP_DONE : (mqttUp ? STEP_RUNNING : STEP_PENDING);
+  if (received > 0) {
+    snprintf(data.detail, sizeof(data.detail), "%d/%d sources", received, STATION_TOPIC_COUNT);
+  }
+
+  return memcmp(previous, gBootSteps, sizeof(previous)) != 0;
+}
+
 // Efface la rémanence profonde (restes d'images précédentes visibles en
 // transparence) : écran entièrement noir puis entièrement blanc, en mode
 // complet. Plus long et plus visible qu'un rafraîchissement normal, il n'est
@@ -1199,32 +1336,62 @@ void setup() {
   display.init(DISPLAY_DIAG_BAUD);
   display.setRotation(0); // Mode paysage (400x300)
 
-  // Laisser au réseau le temps de fournir l'heure et les messages MQTT
-  // retenus, pour que le premier affichage soit complet. Sans réseau, on
-  // affiche quand même au bout du délai.
+  // Écran propre, puis écran de démarrage tenu à jour pendant que le réseau
+  // fournit l'heure et les messages MQTT retenus : le premier affichage de la
+  // station est ainsi complet. Sans réseau, on affiche quand même au bout du
+  // délai, en signalant les étapes en échec.
+  clearPanelGhosts();
+  refreshBootSteps();
+  updateSplashScreen();
+
   constexpr unsigned long BOOT_NETWORK_WAIT_MS = 20000UL;
-  constexpr unsigned long BOOT_RETAINED_WAIT_MS = 2000UL;
+  constexpr unsigned long BOOT_RETAINED_WAIT_MS = 3000UL;
+  constexpr unsigned long BOOT_SPLASH_FINAL_MS = 1500UL;
   const unsigned long bootStart = millis();
-  unsigned long mqttConnectedAt = 0;
+  unsigned long lastProgressAt = 0;
+  uint8_t lastTopicsMask = 0;
   bool mqttSeen = false;
+  bool bootComplete = false;
   while (millis() - bootStart < BOOT_NETWORK_WAIT_MS) {
     serviceNetwork();
     if (gMqttClient.connected() && !mqttSeen) {
       mqttSeen = true;
-      mqttConnectedAt = millis();
+      lastProgressAt = millis();
+    }
+    if (gReceivedTopicsMask != lastTopicsMask) {
+      lastTopicsMask = gReceivedTopicsMask;
+      lastProgressAt = millis();
     }
     updateDateTimeFromClock();
-    if (gTimeValid && mqttSeen && millis() - mqttConnectedAt >= BOOT_RETAINED_WAIT_MS) {
+    if (refreshBootSteps()) {
+      updateSplashScreen();
+    }
+    const bool allTopics = gBootSteps[BOOT_STEP_DATA].state == STEP_DONE;
+    // Un sujet sans message retenu n'arrivera pas : ne plus l'attendre quand
+    // rien de nouveau n'est arrivé depuis quelques secondes. Le délai part du
+    // dernier message, car chaque mise à jour de l'écran bloque MQTT ~0,6 s.
+    if (gTimeValid && mqttSeen && (allTopics || millis() - lastProgressAt >= BOOT_RETAINED_WAIT_MS)) {
+      bootComplete = allTopics;
       break;
     }
     delay(50);
   }
 
+  if (!bootComplete) {
+    for (BootStep& step : gBootSteps) {
+      if (step.state != STEP_DONE) {
+        step.state = STEP_FAILED;
+      }
+    }
+  }
+  // Laisser lire le bilan avant de passer à l'affichage principal.
+  updateSplashScreen();
+  delay(BOOT_SPLASH_FINAL_MS);
+
   updateDateTimeFromClock();
   updateMoonData();
   updateTideForecastFromStoredEvents();
   updateForecastFromStoredData();
-  clearPanelGhosts();
   displayWeatherStation();
 
   STATION_LOG_PRINTLN("Affichage initial terminé");
@@ -1390,6 +1557,12 @@ void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
   STATION_LOG_PRINT(" : ");
   STATION_LOG_PRINTLN(payloadStr);
 #endif
+
+  for (int i = 0; i < STATION_TOPIC_COUNT; ++i) {
+    if (topicStr == STATION_TOPICS[i]) {
+      gReceivedTopicsMask |= static_cast<uint8_t>(1U << i);
+    }
+  }
 
   if (topicStr == TOPIC_TIDE) {
     loadTideDataFromJson(reinterpret_cast<const char*>(payload), length);
