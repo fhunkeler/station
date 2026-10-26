@@ -106,6 +106,7 @@ constexpr int FULL_REFRESH_EVERY_MINUTES = 60;
 // En mode configuration, nouvel essai du WiFi de la maison à cet intervalle,
 // seulement si personne n'est connecté au point d'accès.
 constexpr unsigned long CONFIG_MODE_WIFI_RETRY_MS = 5UL * 60UL * 1000UL;
+constexpr unsigned long CONFIG_MODE_FIRST_RETRY_MS = 30000UL;
 // Fenêtre pendant laquelle un second reset demande le mode configuration.
 constexpr unsigned long DOUBLE_RESET_WINDOW_MS = 10000UL;
 // Un horodatage antérieur à 2020 signifie que l'horloge n'a jamais été réglée.
@@ -1579,7 +1580,8 @@ void setup() {
   refreshBootSteps();
   updateSplashScreen();
 
-  constexpr unsigned long BOOT_NETWORK_WAIT_MS = 20000UL;
+  // La connexion WiFi prend 8 s environ à 80 MHz, davantage si la box tarde.
+  constexpr unsigned long BOOT_NETWORK_WAIT_MS = 30000UL;
   constexpr unsigned long BOOT_RETAINED_WAIT_MS = 3000UL;
   constexpr unsigned long BOOT_SPLASH_FINAL_MS = 1500UL;
   const unsigned long bootStart = millis();
@@ -1638,7 +1640,7 @@ void setup() {
   updateForecastFromStoredData();
   displayWeatherStation();
 
-  STATION_LOG_PRINTLN("Affichage initial terminé");
+  STATION_LOG_PRINTF("Affichage initial terminé (%lu ms après le démarrage)\n", millis());
 }
 
 void loop() {
@@ -1705,7 +1707,11 @@ void serviceNetwork() {
     // changer la radio de canal et coupent le téléphone connecté. On espace
     // donc les essais, et on n'essaie pas quand quelqu'un est connecté.
     const bool fallbackAccessPoint = gConfigReason == ConfigReason::WIFI_UNREACHABLE;
-    const unsigned long retryAfterMs = fallbackAccessPoint ? CONFIG_MODE_WIFI_RETRY_MS : WIFI_FORCE_RECONNECT_AFTER_MS;
+    // Premier essai rapide : un WiFi simplement lent au démarrage ne doit pas
+    // laisser l'écran de configuration affiché pendant 5 minutes.
+    static uint8_t fallbackRetries = 0;
+    const unsigned long retryAfterMs = !fallbackAccessPoint ? WIFI_FORCE_RECONNECT_AFTER_MS
+                                       : (fallbackRetries == 0 ? CONFIG_MODE_FIRST_RETRY_MS : CONFIG_MODE_WIFI_RETRY_MS);
     if (wifiWasConnected) {
       wifiWasConnected = false;
       wifiLostSinceMs = nowMs;
@@ -1714,6 +1720,9 @@ void serviceNetwork() {
                (!fallbackAccessPoint || webPortalAccessPointClients() == 0)) {
       // Filet de sécurité si la reconnexion automatique ne reprend pas.
       wifiLostSinceMs = nowMs;
+      if (fallbackAccessPoint && fallbackRetries < 255) {
+        ++fallbackRetries;
+      }
       WiFi.disconnect();
       WiFi.begin(gConfig.wifiSsid, gConfig.wifiPassword);
       STATION_LOG_PRINTLN("WiFi: reconnexion forcée");
