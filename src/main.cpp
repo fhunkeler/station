@@ -163,16 +163,31 @@ struct Rect {
   int16_t h;
 };
 
-// Quatre bandes pleine largeur, chacune rafraîchie par une fenêtre partielle.
-// Les ordonnées restent indépendantes de l'alignement sur 8 px, qui ne
-// concerne que x et w (toujours 0 et 400 ici).
+// Zones de l'écran, chacune rafraîchie par une fenêtre partielle : en-tête,
+// bande du milieu partagée entre le vent (à gauche) et l'horloge des marées
+// (à droite), puis les mesures. La coupure à x = 200 respecte l'alignement
+// des fenêtres partielles sur 8 px.
 constexpr int16_t SCREEN_MARGIN = 12;
-constexpr Rect HEADER_AREA = {0, 0, 400, 64};
-constexpr Rect TIDE_AREA = {0, 64, 400, 64};
-constexpr Rect WIND_AREA = {0, 128, 400, 68};
-constexpr Rect BOTTOM_AREA = {0, 196, 400, 104};
+constexpr int16_t HEADER_HEIGHT = 96;
+constexpr int16_t MIDDLE_HEIGHT = 112;
+constexpr int16_t MIDDLE_SPLIT_X = 200;
+const Rect gHeaderArea = {0, 0, 400, HEADER_HEIGHT};
+const Rect gWindArea = {0, HEADER_HEIGHT, MIDDLE_SPLIT_X, MIDDLE_HEIGHT};
+const Rect gTideArea = {MIDDLE_SPLIT_X, HEADER_HEIGHT, 400 - MIDDLE_SPLIT_X, MIDDLE_HEIGHT};
+const Rect gBottomArea = {0, HEADER_HEIGHT + MIDDLE_HEIGHT, 400, 300 - HEADER_HEIGHT - MIDDLE_HEIGHT};
 
-// Le repère "maintenant" sur l'arc de marée avance toutes les 10 minutes.
+// Présentation de l'en-tête.
+enum class ScreenLayout : uint8_t {
+  LARGE_CLOCK,  // heure 48 pt, date à droite, lune en icône
+  XL_CLOCK,     // heure 56 pt, jour, date et lune en texte à droite
+};
+ScreenLayout gScreenLayout = ScreenLayout::XL_CLOCK;
+
+void applyScreenLayout(ScreenLayout layout) {
+  gScreenLayout = layout;
+}
+
+// L'aiguille de l'horloge des marées avance toutes les 10 minutes.
 constexpr int TIDE_CHART_REFRESH_MINUTES = 10;
 
 WiFiClient gMqttWiFiClient;
@@ -749,42 +764,126 @@ const char* const FRENCH_MONTH_NAMES[12] = {
   "juillet", "août", "septembre", "octobre", "novembre", "décembre"
 };
 
+// Largeur et ascendante d'un texte dans une police.
+void measureText(const GFXfont* font, const char* text, int& width, int& ascent) {
+  useFont(font);
+  int16_t bx, by;
+  uint16_t bw, bh;
+  display.getTextBounds(text, 0, 0, &bx, &by, &bw, &bh);
+  width = bw;
+  ascent = -by;
+}
+
 void drawHeaderContent() {
   display.setTextColor(GxEPD_BLACK);
+  const int width = display.width();
+  const int bandHeight = gHeaderArea.h - 4;  // au-dessus du filet
 
   char timeStr[6] = "--:--";
+  char dateStr[24] = "";
   if (gTimeValid) {
     snprintf(timeStr, sizeof(timeStr), "%02d:%02d", gNow.tm_hour, gNow.tm_min);
-  }
-  // Heure centrée verticalement au-dessus du filet, quelle que soit la police.
-  useFont(FONT_CLOCK);
-  int16_t clockX, clockY;
-  uint16_t clockW, clockH;
-  display.getTextBounds("00:00", 0, 0, &clockX, &clockY, &clockW, &clockH);
-  const int clockBaseline = (HEADER_AREA.h - 4 - static_cast<int>(clockH)) / 2 - clockY;
-  const int timeRight = printAligned(timeStr, SCREEN_MARGIN, clockBaseline, ALIGN_LEFT);
-
-  if (gTimeValid) {
-    char dateStr[24];
     snprintf(dateStr, sizeof(dateStr), "%d %s", gNow.tm_mday, FRENCH_MONTH_NAMES[gNow.tm_mon % 12]);
-    const int dateX = timeRight + 14;
-    useFont(FONT_MEDIUM_BOLD);
-    printAligned(FRENCH_DAY_NAMES[gNow.tm_wday % 7], dateX, 26, ALIGN_LEFT);
-    useFont(FONT_MEDIUM);
-    printAligned(dateStr, dateX, 48, ALIGN_LEFT);
   }
-
-  const int moonCenterX = display.width() - SCREEN_MARGIN - MOON_ICON_SIZE / 2;
-  const int moonCenterY = 30;
+  char moonText[16] = "";
   if (moonIllumination >= 0) {
-    drawMoonPhase(moonCenterX, moonCenterY, moonPhase);
-    char moonText[16];
     snprintf(moonText, sizeof(moonText), "%d%%", moonIllumination);
-    useFont(FONT_SMALL);
-    printAligned(moonText, moonCenterX - MOON_ICON_SIZE / 2 - 6, moonCenterY + 6, ALIGN_RIGHT);
   }
 
-  display.fillRect(SCREEN_MARGIN, HEADER_AREA.y + HEADER_AREA.h - 3, display.width() - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
+  if (gScreenLayout == ScreenLayout::XL_CLOCK) {
+    // Heure géante à gauche ; jour, date et lune en trois lignes à droite.
+    int clockWidth, clockAscent;
+    measureText(FONT_CLOCK_XL, "00:00", clockWidth, clockAscent);
+    const int clockBaseline = (bandHeight + clockAscent) / 2;
+    useFont(FONT_CLOCK_XL);
+    const int timeRight = printAligned(timeStr, SCREEN_MARGIN, clockBaseline, ALIGN_LEFT);
+    if (gTimeValid) {
+      const int textX = timeRight + 16;
+      const int middle = bandHeight / 2;
+      useFont(FONT_MEDIUM_BOLD);
+      printAligned(FRENCH_DAY_NAMES[gNow.tm_wday % 7], textX, middle - 14, ALIGN_LEFT);
+      useFont(FONT_MEDIUM);
+      printAligned(dateStr, textX, middle + 10, ALIGN_LEFT);
+      if (moonIllumination >= 0) {
+        char moonLine[24];
+        snprintf(moonLine, sizeof(moonLine), "Lune %s", moonText);
+        useFont(FONT_SMALL);
+        printAligned(moonLine, textX, middle + 32, ALIGN_LEFT);
+      }
+    }
+  } else {
+    // Heure à gauche, centrée verticalement ; jour et date à sa droite ;
+    // lune contre le bord droit.
+    const GFXfont* clockFont = FONT_CLOCK_LARGE;
+    int clockWidth, clockAscent;
+    measureText(clockFont, "00:00", clockWidth, clockAscent);
+    const int clockBaseline = (bandHeight + clockAscent) / 2;
+    useFont(clockFont);
+    const int timeRight = printAligned(timeStr, SCREEN_MARGIN, clockBaseline, ALIGN_LEFT);
+
+    const int moonCenterX = width - SCREEN_MARGIN - MOON_ICON_SIZE / 2;
+    if (gTimeValid) {
+      const int dateX = timeRight + 14;
+      const int middle = bandHeight / 2;
+      useFont(FONT_MEDIUM_BOLD);
+      printAligned(FRENCH_DAY_NAMES[gNow.tm_wday % 7], dateX, middle - 4, ALIGN_LEFT);
+      useFont(FONT_MEDIUM);
+      printAligned(dateStr, dateX, middle + 18, ALIGN_LEFT);
+    }
+    if (moonIllumination >= 0) {
+      // Lune au-dessus de son pourcentage, pour laisser la place à la date.
+      useFont(FONT_SMALL);
+      const int moonCenterY = bandHeight / 2 - 10;
+      drawMoonPhase(moonCenterX, moonCenterY, moonPhase);
+      printAligned(moonText, moonCenterX, moonCenterY + MOON_ICON_SIZE / 2 + 18, ALIGN_CENTER);
+    }
+  }
+
+  display.fillRect(SCREEN_MARGIN, gHeaderArea.y + gHeaderArea.h - 3, width - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
+}
+
+// Remplit le polygone convexe pts (coordonnées en unités de rayon, aiguille
+// pointant vers le haut) tourné de angleDeg dans le sens horaire autour de
+// (cx, cy).
+void fillRotatedTriangle(int cx, int cy, float radius, float angleDeg,
+                         float ax, float ay, float bx, float by, float qx, float qy) {
+  const float angle = radians(angleDeg);
+  const float c = cosf(angle);
+  const float s = sinf(angle);
+  auto px = [&](float ux, float uy) { return static_cast<int16_t>(cx + roundf((ux * c - uy * s) * radius)); };
+  auto py = [&](float ux, float uy) { return static_cast<int16_t>(cy + roundf((ux * s + uy * c) * radius)); };
+  display.fillTriangle(px(ax, ay), py(ax, ay), px(bx, by), py(bx, by), px(qx, qy), py(qx, qy), GxEPD_BLACK);
+}
+
+// Horloge des marées : pleine mer en haut, basse mer en bas. L'aiguille
+// tourne dans le sens horaire ; à droite la mer descend, à gauche elle monte.
+// angleDeg : 0 = pleine mer, 180 = basse mer.
+void drawTideDial(int cx, int cy, int radius, float angleDeg) {
+  display.drawCircle(cx, cy, radius, GxEPD_BLACK);
+  display.drawCircle(cx, cy, radius - 1, GxEPD_BLACK);
+  // Douze graduations, environ une par heure (cycle de 12 h 25).
+  for (int i = 0; i < 12; ++i) {
+    if (i == 0 || i == 6) {
+      continue;  // en haut et en bas, les repères PM et BM font office de graduation
+    }
+    const float a = radians(i * 30.0f);
+    const int inner = (i % 3 == 0) ? radius - 8 : radius - 5;
+    display.drawLine(cx + roundf(sinf(a) * inner), cy - roundf(cosf(a) * inner),
+                     cx + roundf(sinf(a) * (radius - 2)), cy - roundf(cosf(a) * (radius - 2)), GxEPD_BLACK);
+  }
+  // Repères près du bord, hors de portée de l'aiguille.
+  useFont(FONT_SMALL_BOLD);
+  printAligned("PM", cx, cy - radius + 19, ALIGN_CENTER);
+  printAligned("BM", cx, cy + radius - 5, ALIGN_CENTER);
+
+  if (!isnan(angleDeg)) {
+    const float r = radius;
+    fillRotatedTriangle(cx, cy, r, angleDeg, 0.0f, -0.48f, 0.17f, -0.2f, -0.17f, -0.2f);  // pointe
+    fillRotatedTriangle(cx, cy, r, angleDeg, -0.06f, -0.22f, 0.06f, -0.22f, 0.06f, 0.15f);  // tige
+    fillRotatedTriangle(cx, cy, r, angleDeg, -0.06f, -0.22f, 0.06f, 0.15f, -0.06f, 0.15f);
+    display.fillCircle(cx, cy, 5, GxEPD_BLACK);
+    display.fillCircle(cx, cy, 2, GxEPD_WHITE);
+  }
 }
 
 // Indice de l'étale à l'instant ts dans gTideEvents, -1 si absente.
@@ -797,181 +896,122 @@ int findTideEventIndex(time_t ts) {
   return -1;
 }
 
-// Heure et hauteur d'une étale sur deux lignes, alignées sur x.
-void drawTideExtremum(const TideEvent& event, int x, TextAlign align) {
-  struct tm eventTm;
-  char timeStr[6] = "--:--";
-  if (localtime_r(&event.ts, &eventTm) != nullptr) {
-    snprintf(timeStr, sizeof(timeStr), "%02d:%02d", eventTm.tm_hour, eventTm.tm_min);
-  }
-  char detail[20];
-  const char* kind = strcmp(event.type, "HIGH") == 0 ? "PM" : "BM";
-  if (isnan(event.height)) {
-    snprintf(detail, sizeof(detail), "%s", kind);
-  } else {
-    snprintf(detail, sizeof(detail), "%s %.1f m", kind, event.height);
-  }
-  useFont(FONT_MEDIUM_BOLD);
-  printAligned(timeStr, x, TIDE_AREA.y + 40, align);
-  useFont(FONT_SMALL);
-  printAligned(detail, x, TIDE_AREA.y + 58, align);
-}
-
-// Marée réduite à la demi-oscillation en cours : étale précédente à gauche,
-// suivante à droite, et entre les deux l'arc correspondant avec la position
-// actuelle.
+// Moitié droite de la bande du milieu : horloge des marées et prochaine étale.
 void drawTideContent() {
-  const int left = SCREEN_MARGIN;
-  const int right = display.width() - SCREEN_MARGIN;
-  const int titleBaseline = TIDE_AREA.y + 16;
-
   display.setTextColor(GxEPD_BLACK);
+  const int left = gTideArea.x + 12;
+  const int right = gTideArea.x + gTideArea.w - SCREEN_MARGIN;
+  const int y0 = gTideArea.y;
+  const int titleBaseline = y0 + 20;
+  // Séparateur avec la moitié vent.
+  display.drawFastVLine(gTideArea.x, y0 + 10, gTideArea.h - 20, GxEPD_BLACK);
+
   time_t nowTs = 0;
   const int nextIdx = findTideEventIndex(nextTideEpoch);
   const int prevIdx = findTideEventIndex(prevTideEpoch);
-  if (!currentEpoch(nowTs) || nextTideEpoch == 0 || nextIdx < 0) {
-    useFont(FONT_SMALL_BOLD);
-    printAligned("MARÉE", left, titleBaseline, ALIGN_LEFT);
+  const bool known = currentEpoch(nowTs) && nextTideEpoch != 0 && nextIdx >= 0;
+
+  useFont(FONT_SMALL_BOLD);
+  // Le sens (montante, descendante) se lit sur le cadran : le titre reste
+  // court pour laisser la place au coefficient.
+  printAligned("MARÉE", left, titleBaseline, ALIGN_LEFT);
+
+  constexpr int DIAL_RADIUS = 40;
+  const int dialCx = left + DIAL_RADIUS;
+  const int dialCy = y0 + 28 + DIAL_RADIUS;
+  if (!known) {
+    drawTideDial(dialCx, dialCy, DIAL_RADIUS, NAN);
     useFont(FONT_SMALL);
-    printAligned("Données indisponibles", display.width() / 2, TIDE_AREA.y + 46, ALIGN_CENTER);
+    printAligned("Données", right, dialCy - 4, ALIGN_RIGHT);
+    printAligned("indisponibles", right, dialCy + 14, ALIGN_RIGHT);
     return;
   }
 
-  useFont(FONT_SMALL_BOLD);
-  printAligned(isTideRising ? "MARÉE MONTANTE" : "MARÉE DESCENDANTE", left, titleBaseline, ALIGN_LEFT);
+  const TideEvent& next = gTideEvents[nextIdx];
+  float angle = NAN;
+  if (prevIdx >= 0 && next.ts > gTideEvents[prevIdx].ts) {
+    const TideEvent& prev = gTideEvents[prevIdx];
+    const float progress =
+        constrain(static_cast<float>(nowTs - prev.ts) / static_cast<float>(next.ts - prev.ts), 0.0f, 1.0f);
+    const bool fromHigh = strcmp(prev.type, "HIGH") == 0;
+    angle = (fromHigh ? 0.0f : 180.0f) + 180.0f * progress;
+  }
+  drawTideDial(dialCx, dialCy, DIAL_RADIUS, angle);
+
+  // Prochaine étale, à droite du cadran.
+  const bool nextHigh = strcmp(next.type, "HIGH") == 0;
+  struct tm eventTm;
+  char timeStr[6] = "--:--";
+  if (localtime_r(&next.ts, &eventTm) != nullptr) {
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d", eventTm.tm_hour, eventTm.tm_min);
+  }
+  const long minutesLeft = static_cast<long>((next.ts - nowTs + 59) / 60);
+  char remaining[24];
+  if (minutesLeft >= 60) {
+    snprintf(remaining, sizeof(remaining), "dans %ld h %02ld", minutesLeft / 60, minutesLeft % 60);
+  } else {
+    snprintf(remaining, sizeof(remaining), "dans %ld min", minutesLeft);
+  }
+  char heightStr[16] = "";
+  if (!isnan(next.height)) {
+    snprintf(heightStr, sizeof(heightStr), "%.1f m", next.height);
+  }
   char coefStr[16];
   if (tideCoefficient >= 0) {
     snprintf(coefStr, sizeof(coefStr), "Coef %d", tideCoefficient);
   } else {
     strcpy(coefStr, "Coef --");
   }
+
+  useFont(FONT_SMALL);
+  printAligned(nextHigh ? "Pleine mer" : "Basse mer", right, y0 + 42, ALIGN_RIGHT);
+  useFont(FONT_MEDIUM_BOLD);
+  printAligned(timeStr, right, y0 + 64, ALIGN_RIGHT);
+  useFont(FONT_SMALL);
+  printAligned(remaining, right, y0 + 82, ALIGN_RIGHT);
+  printAligned(heightStr, right, y0 + 99, ALIGN_RIGHT);
+  useFont(FONT_SMALL_BOLD);
   printAligned(coefStr, right, titleBaseline, ALIGN_RIGHT);
-
-  const TideEvent& next = gTideEvents[nextIdx];
-  drawTideExtremum(next, right, ALIGN_RIGHT);
-  if (prevIdx < 0) {
-    return;
-  }
-  const TideEvent& prev = gTideEvents[prevIdx];
-  drawTideExtremum(prev, left, ALIGN_LEFT);
-
-  // Arc entre les deux étales (règle du cosinus), trame sous la courbe.
-  const int arcLeft = left + 86;
-  const int arcRight = right - 86;
-  const int arcTop = TIDE_AREA.y + 24;
-  const int arcBottom = TIDE_AREA.y + 55;
-  const bool rising = !isnan(prev.height) && !isnan(next.height) ? next.height > prev.height : isTideRising;
-  auto arcY = [&](float progress) {
-    const float level = (1.0f - cosf(PI * progress)) / 2.0f;  // 0 au départ, 1 à l'arrivée
-    const float fromLow = rising ? level : 1.0f - level;
-    return arcBottom - static_cast<int>(roundf(fromLow * (arcBottom - arcTop)));
-  };
-  int prevY = -1;
-  for (int x = arcLeft; x <= arcRight; ++x) {
-    const int y = arcY(static_cast<float>(x - arcLeft) / (arcRight - arcLeft));
-    for (int yy = y + 3; yy <= arcBottom + 2; ++yy) {
-      if ((x % 2 == 0) && (yy % 2 == 0)) {
-        display.drawPixel(x, yy, GxEPD_BLACK);
-      }
-    }
-    if (prevY >= 0) {
-      // Trait de 3 px : les marches d'une pente faible se voient moins.
-      for (int t = -1; t <= 1; ++t) {
-        display.drawLine(x - 1, prevY + t, x, y + t, GxEPD_BLACK);
-      }
-    }
-    prevY = y;
-  }
-  display.drawFastHLine(arcLeft, arcBottom + 3, arcRight - arcLeft + 1, GxEPD_BLACK);
-
-  if (next.ts > prev.ts) {
-    const float progress = constrain(static_cast<float>(nowTs - prev.ts) / static_cast<float>(next.ts - prev.ts), 0.0f, 1.0f);
-    const int nowX = arcLeft + static_cast<int>(roundf(progress * (arcRight - arcLeft)));
-    const int nowY = arcY(progress);
-    display.fillCircle(nowX, nowY, 6, GxEPD_WHITE);
-    display.fillCircle(nowX, nowY, 4, GxEPD_BLACK);
-  }
 }
 
-// Premier point de prévision à partir de l'instant t (tolérance 30 min).
-const ForecastPoint* forecastAt(time_t t) {
-  for (int i = 0; i < gForecastCount; ++i) {
-    if (gForecastPoints[i].ts >= t - 1800) {
-      return &gForecastPoints[i];
-    }
-  }
-  return nullptr;
-}
-
-// Bande vent : situation actuelle à gauche, prévision à +3/+6/+9/+12 h à droite.
+// Moitié gauche de la bande du milieu : vent actuel.
 void drawWindContent() {
   display.setTextColor(GxEPD_BLACK);
-  const int width = display.width();
-  const int y0 = WIND_AREA.y;
-  display.fillRect(SCREEN_MARGIN, y0, width - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
+  const int y0 = gWindArea.y;
+  const int left = SCREEN_MARGIN;
 
-  const int splitX = 200;
-  const int arrowSize = 46;
-  const int arrowCenterX = SCREEN_MARGIN + arrowSize / 2 + 2;
-  const int arrowCenterY = y0 + 36;
-  const int textX = SCREEN_MARGIN + arrowSize + 12;
+  useFont(FONT_SMALL_BOLD);
+  printAligned("VENT", left, y0 + 20, ALIGN_LEFT);
 
   if (isnan(windSpeedKmh) || isnan(windBearingDegrees)) {
-    useFont(FONT_SMALL_BOLD);
-    printAligned("VENT", SCREEN_MARGIN, y0 + 24, ALIGN_LEFT);
     useFont(FONT_MEDIUM);
-    printAligned("--", SCREEN_MARGIN, y0 + 52, ALIGN_LEFT);
+    printAligned("--", left, y0 + 66, ALIGN_LEFT);
+    return;
+  }
+
+  constexpr int ARROW_SIZE = 56;
+  const int arrowCenterX = left + ARROW_SIZE / 2;
+  const int arrowCenterY = y0 + 30 + ARROW_SIZE / 2;
+  drawWindArrow(arrowCenterX, arrowCenterY, windBearingDegrees, ARROW_SIZE);
+
+  const int textX = left + ARROW_SIZE + 12;
+  char speedStr[8];
+  snprintf(speedStr, sizeof(speedStr), "%.0f", windSpeedKmh);
+  useFont(FONT_LARGE);
+  const int speedRight = printAligned(speedStr, textX, y0 + 64, ALIGN_LEFT);
+  useFont(FONT_SMALL);
+  printAligned("km/h", speedRight + 5, y0 + 64, ALIGN_LEFT);
+  useFont(FONT_SMALL_BOLD);
+  printAligned(compassPoint(windBearingDegrees), speedRight + 5, y0 + 44, ALIGN_LEFT);
+
+  char gustStr[24];
+  if (isnan(windGustKmh)) {
+    strcpy(gustStr, "Rafales --");
   } else {
-    drawWindArrow(arrowCenterX, arrowCenterY, windBearingDegrees, arrowSize);
-    char speedStr[8];
-    snprintf(speedStr, sizeof(speedStr), "%.0f", windSpeedKmh);
-    useFont(FONT_LARGE);
-    const int speedRight = printAligned(speedStr, textX, y0 + 41, ALIGN_LEFT);
-    useFont(FONT_SMALL);
-    printAligned("km/h", speedRight + 5, y0 + 41, ALIGN_LEFT);
-    useFont(FONT_SMALL_BOLD);
-    printAligned(compassPoint(windBearingDegrees), speedRight + 5, y0 + 21, ALIGN_LEFT);
-
-    char gustStr[24];
-    if (isnan(windGustKmh)) {
-      strcpy(gustStr, "Rafales --");
-    } else {
-      snprintf(gustStr, sizeof(gustStr), "Rafales %.0f", windGustKmh);
-    }
-    useFont(FONT_SMALL);
-    printAligned(gustStr, textX, y0 + 61, ALIGN_LEFT);
+    snprintf(gustStr, sizeof(gustStr), "Rafales %.0f", windGustKmh);
   }
-
-  display.drawFastVLine(splitX, y0 + 8, WIND_AREA.h - 16, GxEPD_BLACK);
-
-  // Tendance : flèche et vitesse moyenne toutes les 3 heures.
-  time_t nowTs = 0;
-  const bool timeKnown = currentEpoch(nowTs);
-  constexpr int SLOT_COUNT = 4;
-  const int slotsLeft = splitX + 4;
-  const int slotWidth = (width - SCREEN_MARGIN - slotsLeft) / SLOT_COUNT;
-  for (int slot = 0; slot < SLOT_COUNT; ++slot) {
-    const int cx = slotsLeft + slot * slotWidth + slotWidth / 2;
-    const ForecastPoint* point = timeKnown ? forecastAt(nowTs + (slot + 1) * 3 * 3600) : nullptr;
-    char hourStr[6] = "--";
-    char slotSpeed[8] = "--";
-    if (point != nullptr) {
-      struct tm pointTm;
-      if (localtime_r(&point->ts, &pointTm) != nullptr) {
-        snprintf(hourStr, sizeof(hourStr), "%dh", pointTm.tm_hour);
-      }
-      if (!isnan(point->speed)) {
-        snprintf(slotSpeed, sizeof(slotSpeed), "%.0f", point->speed);
-      }
-      if (!isnan(point->bearing)) {
-        drawWindArrow(cx, y0 + 35, point->bearing, 22);
-      }
-    }
-    useFont(FONT_SMALL);
-    printAligned(hourStr, cx, y0 + 18, ALIGN_CENTER);
-    useFont(FONT_SMALL_BOLD);
-    printAligned(slotSpeed, cx, y0 + 64, ALIGN_CENTER);
-  }
+  useFont(FONT_SMALL);
+  printAligned(gustStr, textX, y0 + 90, ALIGN_LEFT);
 }
 
 // Hauteur au-dessus de la ligne de base de sample dans la police font.
@@ -987,10 +1027,13 @@ int fontAscent(const GFXfont* font, const char* sample) {
 // détail. Les lignes s'empilent d'après les métriques des polices, pour que
 // la mise en page tienne quel que soit le thème typographique.
 void drawMeasureColumn(const char* title, int centerX, float temperature, const char* detail, const char* detail2) {
-  const int titleBaseline = BOTTOM_AREA.y + 19;
+  const bool compact = gBottomArea.h < 100;
+  // Ligne de base du titre à 19 px au moins : les capitales accentuées
+  // (É) dépassent vers le haut et toucheraient le filet de la bande.
+  const int titleBaseline = gBottomArea.y + 19;
   // L'échantillon inclut le signe degré, qui dépasse le haut des chiffres.
-  const int temperatureBaseline = titleBaseline + 10 + fontAscent(FONT_LARGE, "0\xB0");
-  const int detailBaseline = temperatureBaseline + 7 + fontAscent(FONT_MEDIUM, "C");
+  const int temperatureBaseline = titleBaseline + (compact ? 5 : 10) + fontAscent(FONT_LARGE, "0\xB0");
+  const int detailBaseline = temperatureBaseline + (compact ? 3 : 7) + fontAscent(FONT_MEDIUM, "C");
   const int detail2Baseline = detailBaseline + 3 + fontAscent(FONT_SMALL, "0");
 
   useFont(FONT_SMALL_BOLD);
@@ -1035,9 +1078,9 @@ void drawBottomContent() {
   drawMeasureColumn(gConfig.labelGround, col2, tempRDC, humRdcStr, nullptr);
   drawMeasureColumn(gConfig.labelFloor, col3, tempEtage, humEtageStr, nullptr);
 
-  display.fillRect(SCREEN_MARGIN, BOTTOM_AREA.y, width - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
-  const int separatorTop = BOTTOM_AREA.y + 10;
-  const int separatorHeight = BOTTOM_AREA.h - 18;
+  display.fillRect(SCREEN_MARGIN, gBottomArea.y, width - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
+  const int separatorTop = gBottomArea.y + 10;
+  const int separatorHeight = gBottomArea.h - 18;
   display.drawFastVLine(SCREEN_MARGIN + columnWidth, separatorTop, separatorHeight, GxEPD_BLACK);
   display.drawFastVLine(SCREEN_MARGIN + 2 * columnWidth, separatorTop, separatorHeight, GxEPD_BLACK);
 }
@@ -1052,19 +1095,19 @@ void refreshArea(const Rect& area, void (*draw)()) {
 }
 
 void updateHeaderSection() {
-  refreshArea(HEADER_AREA, drawHeaderContent);
+  refreshArea(gHeaderArea, drawHeaderContent);
 }
 
 void updateTideSection() {
-  refreshArea(TIDE_AREA, drawTideContent);
+  refreshArea(gTideArea, drawTideContent);
 }
 
 void updateWindSection() {
-  refreshArea(WIND_AREA, drawWindContent);
+  refreshArea(gWindArea, drawWindContent);
 }
 
 void updateBottomSection() {
-  refreshArea(BOTTOM_AREA, drawBottomContent);
+  refreshArea(gBottomArea, drawBottomContent);
 }
 
 // Pastille d'état d'une étape : cercle vide (en attente), cercle et point

@@ -2,7 +2,8 @@
 // des shims Arduino/GxEPD2 (dossier shim/), alimente les vrais parseurs avec
 // des payloads au format de Home Assistant et écrit l'image en PGM 400x300.
 //
-// Usage : preview <sortie.pgm> [empty|stale|splash|splashfail|config]
+// Usage : preview <sortie.pgm> [full|empty|stale|splash|splashfail|config] [disposition]
+// La disposition est le numéro d'une ScreenLayout (0 = grande heure, 1 = heure géante).
 #include "../../src/main.cpp"
 
 SerialStub Serial;
@@ -92,6 +93,9 @@ int main(int argc, char** argv) {
     return 1;
   }
   const std::string mode = argc > 2 ? argv[2] : "";
+  if (argc > 3) {
+    applyScreenLayout(static_cast<ScreenLayout>(atoi(argv[3])));
+  }
   setenv("TZ", TZ_EUROPE_PARIS, 1);
   tzset();
   const time_t now = time(nullptr);
