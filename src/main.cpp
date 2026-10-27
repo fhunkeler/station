@@ -830,17 +830,12 @@ void fillRotatedTriangle(int cx, int cy, float radius, float angleDeg,
 void drawTideDial(int cx, int cy, int radius, float angleDeg) {
   display.drawCircle(cx, cy, radius, GxEPD_BLACK);
   display.drawCircle(cx, cy, radius - 1, GxEPD_BLACK);
-  // Douze graduations, environ une par heure (cycle de 12 h 25) ; pleine et
-  // basse mer en épais, quarts en moyen.
+  // Douze graduations fines, environ une par heure (cycle de 12 h 25) ; pleine
+  // mer, basse mer et quarts un peu plus longues.
   for (int i = 0; i < 12; ++i) {
     const float a = radians(i * 30.0f);
     const float sx = sinf(a);
     const float sy = -cosf(a);
-    if (i == 0 || i == 6) {
-      fillRotatedTriangle(cx, cy, radius, i * 30.0f, -0.07f, -0.98f, 0.07f, -0.98f, 0.07f, -0.72f);
-      fillRotatedTriangle(cx, cy, radius, i * 30.0f, -0.07f, -0.98f, 0.07f, -0.72f, -0.07f, -0.72f);
-      continue;
-    }
     const int inner = (i % 3 == 0) ? radius - 9 : radius - 5;
     display.drawLine(cx + roundf(sx * inner), cy + roundf(sy * inner),
                      cx + roundf(sx * (radius - 2)), cy + roundf(sy * (radius - 2)), GxEPD_BLACK);
