@@ -176,17 +176,6 @@ const Rect gWindArea = {0, HEADER_HEIGHT, MIDDLE_SPLIT_X, MIDDLE_HEIGHT};
 const Rect gTideArea = {MIDDLE_SPLIT_X, HEADER_HEIGHT, 400 - MIDDLE_SPLIT_X, MIDDLE_HEIGHT};
 const Rect gBottomArea = {0, HEADER_HEIGHT + MIDDLE_HEIGHT, 400, 300 - HEADER_HEIGHT - MIDDLE_HEIGHT};
 
-// Présentation de l'en-tête.
-enum class ScreenLayout : uint8_t {
-  LARGE_CLOCK,  // heure 48 pt, date à droite, lune en icône
-  XL_CLOCK,     // heure 56 pt, jour, date et lune en texte à droite
-};
-ScreenLayout gScreenLayout = ScreenLayout::XL_CLOCK;
-
-void applyScreenLayout(ScreenLayout layout) {
-  gScreenLayout = layout;
-}
-
 // L'aiguille de l'horloge des marées avance toutes les 10 minutes.
 constexpr int TIDE_CHART_REFRESH_MINUTES = 10;
 
@@ -790,31 +779,10 @@ void drawHeaderContent() {
     snprintf(moonText, sizeof(moonText), "%d%%", moonIllumination);
   }
 
-  if (gScreenLayout == ScreenLayout::XL_CLOCK) {
-    // Heure géante à gauche ; jour, date et lune en trois lignes à droite.
-    int clockWidth, clockAscent;
-    measureText(FONT_CLOCK_XL, "00:00", clockWidth, clockAscent);
-    const int clockBaseline = (bandHeight + clockAscent) / 2;
-    useFont(FONT_CLOCK_XL);
-    const int timeRight = printAligned(timeStr, SCREEN_MARGIN, clockBaseline, ALIGN_LEFT);
-    if (gTimeValid) {
-      const int textX = timeRight + 16;
-      const int middle = bandHeight / 2;
-      useFont(FONT_MEDIUM_BOLD);
-      printAligned(FRENCH_DAY_NAMES[gNow.tm_wday % 7], textX, middle - 14, ALIGN_LEFT);
-      useFont(FONT_MEDIUM);
-      printAligned(dateStr, textX, middle + 10, ALIGN_LEFT);
-      if (moonIllumination >= 0) {
-        char moonLine[24];
-        snprintf(moonLine, sizeof(moonLine), "Lune %s", moonText);
-        useFont(FONT_SMALL);
-        printAligned(moonLine, textX, middle + 32, ALIGN_LEFT);
-      }
-    }
-  } else {
+  {
     // Heure à gauche, centrée verticalement ; jour et date à sa droite ;
     // lune contre le bord droit.
-    const GFXfont* clockFont = FONT_CLOCK_LARGE;
+    const GFXfont* clockFont = FONT_CLOCK;
     int clockWidth, clockAscent;
     measureText(clockFont, "00:00", clockWidth, clockAscent);
     const int clockBaseline = (bandHeight + clockAscent) / 2;
@@ -855,33 +823,36 @@ void fillRotatedTriangle(int cx, int cy, float radius, float angleDeg,
   display.fillTriangle(px(ax, ay), py(ax, ay), px(bx, by), py(bx, by), px(qx, qy), py(qx, qy), GxEPD_BLACK);
 }
 
-// Horloge des marées : pleine mer en haut, basse mer en bas. L'aiguille
-// tourne dans le sens horaire ; à droite la mer descend, à gauche elle monte.
-// angleDeg : 0 = pleine mer, 180 = basse mer.
+// Horloge des marées : pleine mer en haut, basse mer en bas, repérées par
+// des graduations plus longues. L'aiguille tourne dans le sens horaire ; à
+// droite la mer descend, à gauche elle monte. angleDeg : 0 = pleine mer,
+// 180 = basse mer.
 void drawTideDial(int cx, int cy, int radius, float angleDeg) {
   display.drawCircle(cx, cy, radius, GxEPD_BLACK);
   display.drawCircle(cx, cy, radius - 1, GxEPD_BLACK);
-  // Douze graduations, environ une par heure (cycle de 12 h 25).
+  // Douze graduations, environ une par heure (cycle de 12 h 25) ; pleine et
+  // basse mer en épais, quarts en moyen.
   for (int i = 0; i < 12; ++i) {
-    if (i == 0 || i == 6) {
-      continue;  // en haut et en bas, les repères PM et BM font office de graduation
-    }
     const float a = radians(i * 30.0f);
-    const int inner = (i % 3 == 0) ? radius - 8 : radius - 5;
-    display.drawLine(cx + roundf(sinf(a) * inner), cy - roundf(cosf(a) * inner),
-                     cx + roundf(sinf(a) * (radius - 2)), cy - roundf(cosf(a) * (radius - 2)), GxEPD_BLACK);
+    const float sx = sinf(a);
+    const float sy = -cosf(a);
+    if (i == 0 || i == 6) {
+      fillRotatedTriangle(cx, cy, radius, i * 30.0f, -0.07f, -0.98f, 0.07f, -0.98f, 0.07f, -0.72f);
+      fillRotatedTriangle(cx, cy, radius, i * 30.0f, -0.07f, -0.98f, 0.07f, -0.72f, -0.07f, -0.72f);
+      continue;
+    }
+    const int inner = (i % 3 == 0) ? radius - 9 : radius - 5;
+    display.drawLine(cx + roundf(sx * inner), cy + roundf(sy * inner),
+                     cx + roundf(sx * (radius - 2)), cy + roundf(sy * (radius - 2)), GxEPD_BLACK);
   }
-  // Repères près du bord, hors de portée de l'aiguille.
-  useFont(FONT_SMALL_BOLD);
-  printAligned("PM", cx, cy - radius + 19, ALIGN_CENTER);
-  printAligned("BM", cx, cy + radius - 5, ALIGN_CENTER);
 
   if (!isnan(angleDeg)) {
+    // Aiguille pleine longueur avec contrepoids, comme une aiguille d'horloge.
     const float r = radius;
-    fillRotatedTriangle(cx, cy, r, angleDeg, 0.0f, -0.48f, 0.17f, -0.2f, -0.17f, -0.2f);  // pointe
-    fillRotatedTriangle(cx, cy, r, angleDeg, -0.06f, -0.22f, 0.06f, -0.22f, 0.06f, 0.15f);  // tige
-    fillRotatedTriangle(cx, cy, r, angleDeg, -0.06f, -0.22f, 0.06f, 0.15f, -0.06f, 0.15f);
-    display.fillCircle(cx, cy, 5, GxEPD_BLACK);
+    fillRotatedTriangle(cx, cy, r, angleDeg, 0.0f, -0.86f, 0.2f, -0.5f, -0.2f, -0.5f);    // pointe
+    fillRotatedTriangle(cx, cy, r, angleDeg, -0.08f, -0.52f, 0.08f, -0.52f, 0.08f, 0.25f);  // tige
+    fillRotatedTriangle(cx, cy, r, angleDeg, -0.08f, -0.52f, 0.08f, 0.25f, -0.08f, 0.25f);
+    display.fillCircle(cx, cy, 6, GxEPD_BLACK);
     display.fillCircle(cx, cy, 2, GxEPD_WHITE);
   }
 }
@@ -916,8 +887,8 @@ void drawTideContent() {
   // court pour laisser la place au coefficient.
   printAligned("MARÉE", left, titleBaseline, ALIGN_LEFT);
 
-  constexpr int DIAL_RADIUS = 40;
-  const int dialCx = left + DIAL_RADIUS;
+  constexpr int DIAL_RADIUS = 37;
+  const int dialCx = gTideArea.x + 8 + DIAL_RADIUS;
   const int dialCy = y0 + 28 + DIAL_RADIUS;
   if (!known) {
     drawTideDial(dialCx, dialCy, DIAL_RADIUS, NAN);
@@ -945,13 +916,6 @@ void drawTideContent() {
   if (localtime_r(&next.ts, &eventTm) != nullptr) {
     snprintf(timeStr, sizeof(timeStr), "%02d:%02d", eventTm.tm_hour, eventTm.tm_min);
   }
-  const long minutesLeft = static_cast<long>((next.ts - nowTs + 59) / 60);
-  char remaining[24];
-  if (minutesLeft >= 60) {
-    snprintf(remaining, sizeof(remaining), "dans %ld h %02ld", minutesLeft / 60, minutesLeft % 60);
-  } else {
-    snprintf(remaining, sizeof(remaining), "dans %ld min", minutesLeft);
-  }
   char heightStr[16] = "";
   if (!isnan(next.height)) {
     snprintf(heightStr, sizeof(heightStr), "%.1f m", next.height);
@@ -963,13 +927,13 @@ void drawTideContent() {
     strcpy(coefStr, "Coef --");
   }
 
+  // Prochaine marée : type, heure en grand, hauteur.
   useFont(FONT_SMALL);
-  printAligned(nextHigh ? "Pleine mer" : "Basse mer", right, y0 + 42, ALIGN_RIGHT);
-  useFont(FONT_MEDIUM_BOLD);
-  printAligned(timeStr, right, y0 + 64, ALIGN_RIGHT);
+  printAligned(nextHigh ? "Pleine mer" : "Basse mer", right, y0 + 46, ALIGN_RIGHT);
+  useFont(FONT_LARGE);
+  printAligned(timeStr, right, y0 + 82, ALIGN_RIGHT);
   useFont(FONT_SMALL);
-  printAligned(remaining, right, y0 + 82, ALIGN_RIGHT);
-  printAligned(heightStr, right, y0 + 99, ALIGN_RIGHT);
+  printAligned(heightStr, right, y0 + 102, ALIGN_RIGHT);
   useFont(FONT_SMALL_BOLD);
   printAligned(coefStr, right, titleBaseline, ALIGN_RIGHT);
 }

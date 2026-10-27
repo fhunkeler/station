@@ -27,4 +27,3 @@ convert SemiBold 14 32 255
 convert Bold 25 32 255
 # Horloges : chiffres et ':' seulement.
 convert Bold 48 32 58
-convert Bold 56 32 58
