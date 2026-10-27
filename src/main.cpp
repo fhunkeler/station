@@ -847,8 +847,7 @@ void drawTideDial(int cx, int cy, int radius, float angleDeg) {
     fillRotatedTriangle(cx, cy, r, angleDeg, 0.0f, -0.86f, 0.2f, -0.5f, -0.2f, -0.5f);    // pointe
     fillRotatedTriangle(cx, cy, r, angleDeg, -0.08f, -0.52f, 0.08f, -0.52f, 0.08f, 0.25f);  // tige
     fillRotatedTriangle(cx, cy, r, angleDeg, -0.08f, -0.52f, 0.08f, 0.25f, -0.08f, 0.25f);
-    display.fillCircle(cx, cy, 6, GxEPD_BLACK);
-    display.fillCircle(cx, cy, 2, GxEPD_WHITE);
+    display.fillCircle(cx, cy, 5, GxEPD_BLACK);
   }
 }
 
