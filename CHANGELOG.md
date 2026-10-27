@@ -3,6 +3,23 @@
 Toutes les évolutions notables du firmware de la station e-paper.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 
+## [2.1.0] - 2026-10-27
+
+### Modifié
+- **Heure agrandie** (Barlow Condensed 48 pt) sur un en-tête plus haut, avec
+  le jour et la date à sa droite et l'icône de lune, avec son pourcentage
+  d'éclairement, en haut à droite.
+- **Horloge des marées** à la place de l'arc de marée : cadran à graduations
+  fines (pleine mer en haut, basse mer en bas) et aiguille qui avance d'une
+  étale à l'autre, avec à côté le type, l'heure et la hauteur de la prochaine
+  étale et le coefficient.
+- Le vent et la marée partagent désormais la bande du milieu, côte à côte.
+
+### Supprimé
+- Prévision du vent à +3/+6/+9/+12 h à l'écran (le message de prévision
+  reste lu pour le vent actuel).
+- Décompte « dans X min » avant la prochaine étale, remplacé par son heure.
+
 ## [2.0.0] - 2026-10-26
 
 ### Ajouté
