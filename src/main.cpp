@@ -810,45 +810,37 @@ void drawHeaderContent() {
   display.fillRect(SCREEN_MARGIN, gHeaderArea.y + gHeaderArea.h - 3, width - 2 * SCREEN_MARGIN, 2, GxEPD_BLACK);
 }
 
-// Remplit le polygone convexe pts (coordonnées en unités de rayon, aiguille
-// pointant vers le haut) tourné de angleDeg dans le sens horaire autour de
-// (cx, cy).
-void fillRotatedTriangle(int cx, int cy, float radius, float angleDeg,
-                         float ax, float ay, float bx, float by, float qx, float qy) {
-  const float angle = radians(angleDeg);
-  const float c = cosf(angle);
-  const float s = sinf(angle);
-  auto px = [&](float ux, float uy) { return static_cast<int16_t>(cx + roundf((ux * c - uy * s) * radius)); };
-  auto py = [&](float ux, float uy) { return static_cast<int16_t>(cy + roundf((ux * s + uy * c) * radius)); };
-  display.fillTriangle(px(ax, ay), py(ax, ay), px(bx, by), py(bx, by), px(qx, qy), py(qx, qy), GxEPD_BLACK);
+// Flèche verticale pleine centrée en (cx, cy) : vers le haut si up.
+void drawTrendArrow(int cx, int cy, bool up) {
+  const int d = up ? -1 : 1;
+  display.fillTriangle(cx, cy + d * 9, cx - 7, cy + d * 1, cx + 7, cy + d * 1, GxEPD_BLACK);
+  display.fillRect(cx - 2, up ? cy + 1 : cy - 9, 5, 9, GxEPD_BLACK);
 }
 
-// Horloge des marées : pleine mer en haut, basse mer en bas, repérées par
-// des graduations plus longues. L'aiguille tourne dans le sens horaire ; à
-// droite la mer descend, à gauche elle monte. angleDeg : 0 = pleine mer,
-// 180 = basse mer.
+// Horloge des marées : pleine mer en haut, basse mer en bas, quarts repérés
+// par une graduation. Une bille fait le tour du cadran dans le sens horaire :
+// à droite la mer descend, à gauche elle monte ; le sens est rappelé par une
+// flèche au centre. angleDeg : 0 = pleine mer, 180 = basse mer, NAN = inconnu.
 void drawTideDial(int cx, int cy, int radius, float angleDeg) {
   display.drawCircle(cx, cy, radius, GxEPD_BLACK);
   display.drawCircle(cx, cy, radius - 1, GxEPD_BLACK);
-  // Douze graduations fines, environ une par heure (cycle de 12 h 25) ; pleine
-  // mer, basse mer et quarts un peu plus longues.
-  for (int i = 0; i < 12; ++i) {
-    const float a = radians(i * 30.0f);
+  for (int i = 0; i < 4; ++i) {
+    const float a = radians(i * 90.0f);
     const float sx = sinf(a);
     const float sy = -cosf(a);
-    const int inner = (i % 3 == 0) ? radius - 9 : radius - 5;
-    display.drawLine(cx + roundf(sx * inner), cy + roundf(sy * inner),
+    display.drawLine(cx + roundf(sx * (radius - 9)), cy + roundf(sy * (radius - 9)),
                      cx + roundf(sx * (radius - 2)), cy + roundf(sy * (radius - 2)), GxEPD_BLACK);
   }
-
-  if (!isnan(angleDeg)) {
-    // Aiguille pleine longueur avec contrepoids, comme une aiguille d'horloge.
-    const float r = radius;
-    fillRotatedTriangle(cx, cy, r, angleDeg, 0.0f, -0.86f, 0.2f, -0.5f, -0.2f, -0.5f);    // pointe
-    fillRotatedTriangle(cx, cy, r, angleDeg, -0.08f, -0.52f, 0.08f, -0.52f, 0.08f, 0.25f);  // tige
-    fillRotatedTriangle(cx, cy, r, angleDeg, -0.08f, -0.52f, 0.08f, 0.25f, -0.08f, 0.25f);
-    display.fillCircle(cx, cy, 5, GxEPD_BLACK);
+  if (isnan(angleDeg)) {
+    return;
   }
+  const float a = fmodf(angleDeg, 360.0f);
+  // La bille coupe le cercle : un liseré blanc la détache du tracé.
+  const int bx = cx + roundf(sinf(radians(a)) * (radius - 1));
+  const int by = cy - roundf(cosf(radians(a)) * (radius - 1));
+  display.fillCircle(bx, by, 9, GxEPD_WHITE);
+  display.fillCircle(bx, by, 7, GxEPD_BLACK);
+  drawTrendArrow(cx, cy, a > 180.0f);
 }
 
 // Indice de l'étale à l'instant ts dans gTideEvents, -1 si absente.
@@ -881,9 +873,10 @@ void drawTideContent() {
   // court pour laisser la place au coefficient.
   printAligned("MARÉE", left, titleBaseline, ALIGN_LEFT);
 
-  constexpr int DIAL_RADIUS = 37;
-  const int dialCx = gTideArea.x + 8 + DIAL_RADIUS;
-  const int dialCy = y0 + 28 + DIAL_RADIUS;
+  // Place pour la bille (rayon 9 avec son liseré) tout autour du cadran.
+  constexpr int DIAL_RADIUS = 35;
+  const int dialCx = gTideArea.x + 13 + DIAL_RADIUS;
+  const int dialCy = y0 + 30 + DIAL_RADIUS;
   if (!known) {
     drawTideDial(dialCx, dialCy, DIAL_RADIUS, NAN);
     useFont(FONT_SMALL);
@@ -904,7 +897,6 @@ void drawTideContent() {
   drawTideDial(dialCx, dialCy, DIAL_RADIUS, angle);
 
   // Prochaine étale, à droite du cadran.
-  const bool nextHigh = strcmp(next.type, "HIGH") == 0;
   struct tm eventTm;
   char timeStr[6] = "--:--";
   if (localtime_r(&next.ts, &eventTm) != nullptr) {
@@ -921,13 +913,12 @@ void drawTideContent() {
     strcpy(coefStr, "Coef --");
   }
 
-  // Prochaine marée : type, heure en grand, hauteur.
-  useFont(FONT_SMALL);
-  printAligned(nextHigh ? "Pleine mer" : "Basse mer", right, y0 + 46, ALIGN_RIGHT);
+  // Prochaine marée : heure en grand et hauteur. Son type se déduit de la
+  // flèche du cadran (montante : pleine mer, descendante : basse mer).
   useFont(FONT_LARGE);
-  printAligned(timeStr, right, y0 + 82, ALIGN_RIGHT);
+  printAligned(timeStr, right, y0 + 72, ALIGN_RIGHT);
   useFont(FONT_SMALL);
-  printAligned(heightStr, right, y0 + 102, ALIGN_RIGHT);
+  printAligned(heightStr, right, y0 + 94, ALIGN_RIGHT);
   useFont(FONT_SMALL_BOLD);
   printAligned(coefStr, right, titleBaseline, ALIGN_RIGHT);
 }
