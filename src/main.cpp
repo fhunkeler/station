@@ -752,6 +752,12 @@ const char* const FRENCH_MONTH_NAMES[12] = {
   "janvier", "février", "mars", "avril", "mai", "juin",
   "juillet", "août", "septembre", "octobre", "novembre", "décembre"
 };
+// Version de l'en-tête : les mois les plus longs sont abrégés pour tenir
+// entre l'heure la plus large et la lune.
+const char* const FRENCH_MONTH_HEADER_NAMES[12] = {
+  "janvier", "février", "mars", "avril", "mai", "juin",
+  "juillet", "août", "sept.", "octobre", "nov.", "déc."
+};
 
 // Largeur et ascendante d'un texte dans une police.
 void measureText(const GFXfont* font, const char* text, int& width, int& ascent) {
@@ -772,7 +778,7 @@ void drawHeaderContent() {
   char dateStr[24] = "";
   if (gTimeValid) {
     snprintf(timeStr, sizeof(timeStr), "%02d:%02d", gNow.tm_hour, gNow.tm_min);
-    snprintf(dateStr, sizeof(dateStr), "%d %s", gNow.tm_mday, FRENCH_MONTH_NAMES[gNow.tm_mon % 12]);
+    snprintf(dateStr, sizeof(dateStr), "%d %s", gNow.tm_mday, FRENCH_MONTH_HEADER_NAMES[gNow.tm_mon % 12]);
   }
   char moonText[16] = "";
   if (moonIllumination >= 0) {
@@ -780,23 +786,25 @@ void drawHeaderContent() {
   }
 
   {
-    // Heure à gauche, centrée verticalement ; jour et date à sa droite ;
-    // lune contre le bord droit.
+    // Heure à gauche, centrée verticalement ; jour et date à droite,
+    // contre la lune, elle-même contre le bord droit.
     const GFXfont* clockFont = FONT_CLOCK;
     int clockWidth, clockAscent;
     measureText(clockFont, "00:00", clockWidth, clockAscent);
     const int clockBaseline = (bandHeight + clockAscent) / 2;
     useFont(clockFont);
-    const int timeRight = printAligned(timeStr, SCREEN_MARGIN, clockBaseline, ALIGN_LEFT);
+    printAligned(timeStr, SCREEN_MARGIN, clockBaseline, ALIGN_LEFT);
 
     const int moonCenterX = width - SCREEN_MARGIN - MOON_ICON_SIZE / 2;
     if (gTimeValid) {
-      const int dateX = timeRight + 14;
+      // Jour et date alignés à droite contre la lune : leur position ne dépend
+      // pas de la largeur de l'heure, dont les chiffres n'ont pas tous la même.
+      const int dateRight = moonCenterX - MOON_ICON_SIZE / 2 - 12;
       const int middle = bandHeight / 2;
       useFont(FONT_MEDIUM_BOLD);
-      printAligned(FRENCH_DAY_NAMES[gNow.tm_wday % 7], dateX, middle - 4, ALIGN_LEFT);
+      printAligned(FRENCH_DAY_NAMES[gNow.tm_wday % 7], dateRight, middle - 4, ALIGN_RIGHT);
       useFont(FONT_MEDIUM);
-      printAligned(dateStr, dateX, middle + 18, ALIGN_LEFT);
+      printAligned(dateStr, dateRight, middle + 18, ALIGN_RIGHT);
     }
     if (moonIllumination >= 0) {
       // Lune au-dessus de son pourcentage, pour laisser la place à la date.
