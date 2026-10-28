@@ -3,6 +3,14 @@
 Toutes les évolutions notables du firmware de la station e-paper.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 
+## [2.2.1] - 2026-10-28
+
+### Corrigé
+- Le jour et la date ne se décalent plus d'une minute à l'autre selon la
+  largeur des chiffres de l'heure : ils sont alignés à droite contre la lune.
+  Septembre, novembre et décembre sont abrégés dans l'en-tête (« sept. »,
+  « nov. », « déc. ») pour tenir à côté de l'heure la plus large.
+
 ## [2.2.0] - 2026-10-28
 
 ### Modifié
