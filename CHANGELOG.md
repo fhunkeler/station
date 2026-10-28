@@ -3,6 +3,18 @@
 Toutes les évolutions notables du firmware de la station e-paper.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 
+## [2.2.0] - 2026-10-28
+
+### Modifié
+- **Horloge des marées « satellite »** : une bille fait le tour du cadran
+  d'une étale à l'autre (pleine mer en haut, basse mer en bas) à la place de
+  l'aiguille, et une flèche au centre indique si la mer monte ou descend.
+  Graduations réduites aux quatre quarts.
+
+### Supprimé
+- Libellé « Pleine mer » / « Basse mer » de la prochaine étale : son type se
+  lit sur la flèche du cadran. Restent l'heure et la hauteur.
+
 ## [2.1.0] - 2026-10-27
 
 ### Modifié
